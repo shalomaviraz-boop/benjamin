@@ -22,10 +22,93 @@ def get_client():
     return _client
 
 
-def _inject_memory(contents: str, memory_context: str | None) -> str:
+def _inject_memory(contents: str, memory_context) -> str:
+    """
+    Inject structured memory into the prompt.
+    memory_context may be a dict (preferred) or a string.
+    """
     if not memory_context:
         return contents
-    return f"# Memory Context\n{memory_context}\n\n{contents}"
+
+    # If it's already a string, keep backward compatibility.
+    if isinstance(memory_context, str):
+        mem_block = f"# Memory Context\n{memory_context}"
+        return f"{mem_block}\n\n{contents}"
+
+    if not isinstance(memory_context, dict):
+        mem_block = f"# Memory Context\n{str(memory_context)}"
+        return f"{mem_block}\n\n{contents}"
+
+    user_profile = memory_context.get("user_profile") or {}
+    relevant_memories = memory_context.get("relevant_memories") or []
+    recent_memories = memory_context.get("recent_memories") or []
+    project_state = memory_context.get("project_state") or {}
+    conversation_tail = memory_context.get("conversation_tail") or []
+
+    lines: list[str] = []
+    lines.append("# Memory Context")
+
+    # Profile
+    if isinstance(user_profile, dict) and user_profile:
+        lines.append("## User Profile")
+        for k, v in user_profile.items():
+            if v is None:
+                continue
+            lines.append(f"- {k}: {v}")
+
+    # Conversation tail
+    if isinstance(conversation_tail, list) and conversation_tail:
+        lines.append("## Conversation (recent turns)")
+        for m in conversation_tail[-15:]:
+            if not isinstance(m, dict):
+                continue
+            role = (m.get("role") or "").strip() or "unknown"
+            text = (m.get("content") or "").strip()
+            if not text:
+                continue
+            # Keep it compact
+            if len(text) > 800:
+                text = text[:800].rstrip() + "…"
+            lines.append(f"- {role}: {text}")
+
+    # Relevant memories (semantic)
+    if isinstance(relevant_memories, list) and relevant_memories:
+        lines.append("## Relevant Memories")
+        for mem in relevant_memories[:10]:
+            if isinstance(mem, dict):
+                key = (mem.get("key") or "").strip()
+                val = mem.get("value")
+                if key:
+                    lines.append(f"- {key}: {val}")
+                else:
+                    lines.append(f"- {val}")
+            else:
+                lines.append(f"- {mem}")
+
+    # Recent memories (last written)
+    if isinstance(recent_memories, list) and recent_memories:
+        lines.append("## Recent Memories")
+        for mem in recent_memories[:10]:
+            if isinstance(mem, dict):
+                key = (mem.get("key") or "").strip()
+                val = mem.get("value")
+                if key:
+                    lines.append(f"- {key}: {val}")
+                else:
+                    lines.append(f"- {val}")
+            else:
+                lines.append(f"- {mem}")
+
+    # Project state
+    if isinstance(project_state, dict) and project_state:
+        lines.append("## Project State")
+        for k, v in project_state.items():
+            if v is None:
+                continue
+            lines.append(f"- {k}: {v}")
+
+    mem_block = "\n".join(lines)
+    return f"{mem_block}\n\n{contents}"
 
 
 def _generate_fast_sync(contents: str) -> str:

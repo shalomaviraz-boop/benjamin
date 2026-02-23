@@ -1,6 +1,8 @@
 """Message handler - routing, approval flow, kill switch, memory."""
 import re
 from collections import deque
+import sqlite3
+from pathlib import Path
 
 from memory.memory_store import (
     upsert_memory,
@@ -27,6 +29,58 @@ RECALL_PHRASES = {
     "what do you remember about me",
 }
 
+# --- Conversation SQLite setup ---
+_DB_PATH = Path(__file__).resolve().parent.parent / "conversation.db"
+
+
+def _get_conn():
+    conn = sqlite3.connect(_DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    return conn
+
+
+def _save_turn(user_id: str, role: str, content: str) -> None:
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO conversation_messages (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, role, content),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_tail(user_id: str, limit: int = 15) -> list[dict]:
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """
+            SELECT role, content
+            FROM conversation_messages
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    rows.reverse()
+    return [{"role": r[0], "content": r[1]} for r in rows]
+
 
 def _load_memory_context(user_id: str, message: str) -> dict:
     """Load user profile + relevant memories + project state for prompts."""
@@ -34,11 +88,13 @@ def _load_memory_context(user_id: str, message: str) -> dict:
     relevant_memories = search_memories(user_id, message, limit=8)
     recent_memories = list_memories(user_id, limit=10)
     project_state = get_project_state(user_id)
+    conversation_tail = _get_tail(user_id, limit=15)
     return {
         "user_profile": profile,
         "relevant_memories": relevant_memories,
         "recent_memories": recent_memories,
         "project_state": project_state,
+        "conversation_tail": conversation_tail,
     }
 
 
@@ -309,6 +365,9 @@ class BenjaminMessageHandler:
         }
         self.active_contexts[user_id] = exec_context
         try:
+            # Save user message
+            _save_turn(user_id, "user", message)
+
             result = await self.orchestrator.execute(
                 message, plan, exec_context, resume_state
             )
@@ -326,12 +385,9 @@ class BenjaminMessageHandler:
             # Persist suggested memory only after successful execution + approval gate
             _persist_memory(user_id, plan)
 
-            self._store_context(user_id, message, result)
+            # Save assistant response
+            _save_turn(user_id, "assistant", result)
+
             return result
         finally:
             self.active_contexts.pop(user_id, None)
-
-    def _store_context(self, user_id: str, message: str, response: str) -> None:
-        if user_id not in self.context:
-            self.context[user_id] = deque(maxlen=3)
-        self.context[user_id].append(f"User: {message}\nAssistant: {response}")
