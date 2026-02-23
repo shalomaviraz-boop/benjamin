@@ -63,6 +63,16 @@ def _init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS personal_model (
+                user_id TEXT PRIMARY KEY,
+                model_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+
         # Prevent duplicates/spam
         conn.execute(
             """
@@ -152,6 +162,58 @@ def upsert_project_state(user_id: str, state: dict | str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+# ---------- Personal Model ----------
+
+
+def get_personal_model(user_id: str) -> dict | None:
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT model_json FROM personal_model WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row or not row["model_json"]:
+            return None
+        return {"model_json": row["model_json"]}
+    finally:
+        conn.close()
+
+
+def upsert_personal_model(user_id: str, model: dict | str) -> None:
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO personal_model(user_id, model_json, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              model_json=excluded.model_json,
+              updated_at=excluded.updated_at
+            """,
+            (user_id, str(model), _now_ts()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_personal_model_field(user_id: str, field: str, value: Any) -> None:
+    """
+    Lightweight field update (expects model_json stored as dict-like string).
+    This keeps it simple for MVP.
+    """
+    existing = get_personal_model(user_id)
+    data = {}
+    if existing and existing.get("model_json"):
+        try:
+            data = eval(existing["model_json"])
+        except Exception:
+            data = {}
+
+    data[str(field)] = value
+    upsert_personal_model(user_id, data)
 
 
 # ---------- Memories ----------

@@ -98,6 +98,16 @@ class BenjaminOrchestrator:
         print(f"Routing decision: {plan}")
         return plan
 
+    async def governor(self, message: str, memory_context: dict | None = None) -> dict:
+        """
+        Run Personal Governor analysis (internal, before execution).
+        """
+        memory_context = memory_context or {}
+        personal_model = memory_context.get("user_profile") or {}
+        g = await self.router.analyze_governor(message, personal_model=personal_model)
+        print(f"Governor decision: {g}")
+        return g
+
     def needs_approval(self, plan: dict, message: str) -> bool:
         """
         Approval rule:

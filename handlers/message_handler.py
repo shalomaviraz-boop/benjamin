@@ -11,6 +11,9 @@ from memory.memory_store import (
     get_profile,
     get_project_state,
     search_memories,
+    get_personal_model,
+    upsert_personal_model,
+    update_personal_model_field,
 )
 from orchestrator.benjamin_orchestrator import BenjaminOrchestrator
 
@@ -28,6 +31,9 @@ RECALL_PHRASES = {
     "מה את זוכרת עלי",
     "what do you remember about me",
 }
+
+SHOW_MODEL_PHRASES = {"הצג מודל אישי", "show personal model"}
+UPDATE_MODEL_PREFIXES = ("עדכן מודל אישי", "update personal model")
 
 # --- Conversation SQLite setup ---
 _DB_PATH = Path(__file__).resolve().parent.parent / "conversation.db"
@@ -85,12 +91,14 @@ def _get_tail(user_id: str, limit: int = 15) -> list[dict]:
 def _load_memory_context(user_id: str, message: str) -> dict:
     """Load user profile + relevant memories + project state for prompts."""
     profile = get_profile(user_id)
+    personal_model = get_personal_model(user_id) or {}
     relevant_memories = search_memories(user_id, message, limit=8)
     recent_memories = list_memories(user_id, limit=10)
     project_state = get_project_state(user_id)
     conversation_tail = _get_tail(user_id, limit=15)
     return {
         "user_profile": profile,
+        "personal_model": personal_model,
         "relevant_memories": relevant_memories,
         "recent_memories": recent_memories,
         "project_state": project_state,
@@ -234,6 +242,29 @@ class BenjaminMessageHandler:
         if normalized in RECALL_PHRASES:
             return self._format_recall_response(user_id)
 
+        # Show personal model
+        if normalized in SHOW_MODEL_PHRASES:
+            personal_model = get_personal_model(user_id) or {}
+            if not personal_model:
+                return "אין עדיין מודל אישי שמור."
+            return "מודל אישי:\n" + str(personal_model)
+
+        # Update personal model (JSON expected after prefix)
+        for prefix in UPDATE_MODEL_PREFIXES:
+            if trimmed.startswith(prefix):
+                try:
+                    import json
+                    json_part = trimmed[len(prefix):].strip()
+                    if json_part.startswith(":"):
+                        json_part = json_part[1:].strip()
+                    data = json.loads(json_part)
+                    if not isinstance(data, dict):
+                        return "יש לספק JSON תקין כאובייקט."
+                    upsert_personal_model(user_id, data)
+                    return "המודל האישי עודכן."
+                except Exception:
+                    return "JSON לא תקין. כתוב: עדכן מודל אישי: { ... }"
+
         # Explicit remember (no approval)
         if trimmed.lower().startswith(REMEMBER_PREFIXES):
             return await self._handle_explicit_remember(user_id, trimmed)
@@ -242,8 +273,33 @@ class BenjaminMessageHandler:
         if user_id in self.pending_plans:
             return await self._handle_approval(normalized, user_id)
 
-        # Normal flow: load memory, plan, execute
+        # Normal flow: load memory
         memory_context = _load_memory_context(user_id, message)
+
+        # --- Auto Learning: Profile Extractor ---
+        try:
+            profile_update = await self.orchestrator.router.extract_profile_update(message)
+            if profile_update.get("should_update"):
+                field = profile_update.get("field")
+                value = profile_update.get("value")
+                override = profile_update.get("override", False)
+
+                existing_model = memory_context.get("personal_model") or {}
+
+                if override or field not in existing_model:
+                    update_personal_model_field(user_id, field, value)
+                    # refresh local copy
+                    memory_context["personal_model"] = (
+                        get_personal_model(user_id) or {}
+                    )
+                    print(f"Auto-learned field: {field}={value}")
+        except Exception as e:
+            print(f"Profile extractor error: {e}")
+
+        # --- Governor (after personal model update) ---
+        governor = await self.orchestrator.governor(message, memory_context)
+        memory_context["governor"] = governor
+
         plan = await self.orchestrator.plan(message, memory_context)
 
         if self.orchestrator.needs_approval(plan, message):

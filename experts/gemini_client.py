@@ -56,6 +56,25 @@ def _inject_memory(contents: str, memory_context) -> str:
                 continue
             lines.append(f"- {k}: {v}")
 
+    # Governor guidance (internal)
+    governor = memory_context.get("governor") or {}
+    if isinstance(governor, dict) and governor:
+        lines.append("## Governor Guidance")
+        il = governor.get("intervention_level")
+        act = governor.get("recommended_action")
+        ol = (governor.get("opening_line") or "").strip()
+        sq = (governor.get("sharp_question") or "").strip()
+        rp = governor.get("risk_pattern")
+        sc = governor.get("alignment_score")
+        lines.append(f"- alignment_score: {sc}")
+        lines.append(f"- risk_pattern: {rp}")
+        lines.append(f"- intervention_level: {il}")
+        lines.append(f"- recommended_action: {act}")
+        if ol:
+            lines.append(f"- opening_line: {ol}")
+        if sq:
+            lines.append(f"- sharp_question: {sq}")
+
     # Conversation tail
     if isinstance(conversation_tail, list) and conversation_tail:
         lines.append("## Conversation (recent turns)")

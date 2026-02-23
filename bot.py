@@ -17,7 +17,52 @@ from telegram.ext import (
 
 from handlers.message_handler import BenjaminMessageHandler
 
+# --- Proactive job imports ---
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
+
 handler = BenjaminMessageHandler()
+
+
+# --- Proactive Daily Jobs ---
+
+async def send_us_market_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """01:00 Israel time – US markets + major economic events."""
+    try:
+        chat_id = context.job.data.get("chat_id")
+        if not chat_id:
+            return
+
+        prompt = (
+            "תן סיכום תמציתי של האירועים הכלכליים המרכזיים שקרו היום בארה\"ב "
+            "כולל שינויי אחוזים במדדים: S&P 500, Nasdaq, Dow Jones. "
+            "תשובה קצרה וברורה בעברית."
+        )
+
+        response = await handler.handle(prompt, str(chat_id))
+        await context.bot.send_message(chat_id=chat_id, text=response)
+
+    except Exception as e:
+        print(f"US summary job error: {e}")
+
+
+async def send_ai_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """01:10 Israel time – AI news summary."""
+    try:
+        chat_id = context.job.data.get("chat_id")
+        if not chat_id:
+            return
+
+        prompt = (
+            "תן סיכום תמציתי של האירועים המרכזיים שקרו היום בתחום הבינה המלאכותית "
+            "בעולם. תשובה קצרה וברורה בעברית."
+        )
+
+        response = await handler.handle(prompt, str(chat_id))
+        await context.bot.send_message(chat_id=chat_id, text=response)
+
+    except Exception as e:
+        print(f"AI summary job error: {e}")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -58,6 +103,33 @@ def main() -> None:
     loop.run_until_complete(_cleanup())
 
     app = Application.builder().token(token).build()
+
+    # --- Scheduler setup ---
+    tz = ZoneInfo("Asia/Jerusalem")
+
+    # IMPORTANT:
+    # Replace this with your own Telegram user ID if needed
+    default_chat_id = os.getenv("PROACTIVE_CHAT_ID") or "1796609485"
+
+    if default_chat_id:
+        app.job_queue.run_daily(
+            send_us_market_summary,
+            time=dtime(hour=1, minute=0, tzinfo=tz),
+            data={"chat_id": default_chat_id},
+            name="us_market_summary",
+        )
+
+        app.job_queue.run_daily(
+            send_ai_summary,
+            time=dtime(hour=1, minute=10, tzinfo=tz),
+            data={"chat_id": default_chat_id},
+            name="ai_summary",
+        )
+
+        print("📆 Proactive jobs scheduled (01:00 + 01:10 Asia/Jerusalem)")
+    else:
+        print("⚠️ PROACTIVE_CHAT_ID not set – proactive mode disabled.")
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

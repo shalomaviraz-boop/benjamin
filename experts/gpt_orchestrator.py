@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("GPT_ROUTER_MODEL", "gpt-4o-mini")
+GOVERNOR_MODEL = os.getenv("GPT_GOVERNOR_MODEL", MODEL)
 
 
 def _clean_key(raw: str) -> str:
@@ -185,6 +186,49 @@ Memory (חשוב!):
 }
 """.strip()
 
+GOVERNOR_SYSTEM_PROMPT = """
+You are Benjamin's internal Governor. Your job is to analyze the user's message against the user's Personal Model and return a SMALL JSON object.
+You do NOT answer the user. You only decide how Benjamin should respond.
+
+Return ONLY valid JSON with this schema:
+{
+  "alignment_score": 0-100,
+  "risk_pattern": "overengineering"|"project_switching"|"analysis_paralysis"|"avoidance"|"none",
+  "intervention_level": 0|1|2,
+  "recommended_action": "answer"|"ask_question"|"reframe"|"push_back",
+  "opening_line": "<one short Hebrew line Benjamin should start with if intervention_level>0, otherwise empty>",
+  "sharp_question": "<one short Hebrew question to ask before/with the answer if intervention_level>0, otherwise empty>",
+  "notes": "<max 120 chars internal note>"
+}
+
+Guidelines:
+- Be conservative: only intervene when it meaningfully improves focus or prevents distraction.
+- Match the user's preference: concise, direct, no long explanations.
+- If the user is asking for actionable help that aligns with goals, set intervention_level=0.
+- If the user is drifting / starting a new big project / over-architecting, set intervention_level=1 or 2.
+""".strip()
+
+PROFILE_EXTRACTOR_SYSTEM_PROMPT = """
+You are Benjamin's Profile Extractor.
+Your job: detect if the user's message contains durable personal information
+that should update the Personal Model.
+
+Return ONLY valid JSON with this schema:
+{
+  "field": "<string field name or empty>",
+  "value": "<string value>",
+  "confidence": 0-100,
+  "override": true|false
+}
+
+Rules:
+- Extract ONLY stable traits, goals, preferences, identity facts.
+- Ignore temporary states ("אני עייף היום", "בא לי פיצה").
+- If nothing durable → return field="" and confidence=0.
+- Confidence must reflect how sure you are this is long-term.
+- Be conservative.
+""".strip()
+
 
 def _build_user_prompt(message: str, memory_context: Optional[dict]) -> str:
     mc = memory_context or {}
@@ -236,3 +280,92 @@ class GPTOrchestrator:
         text = (resp.choices[0].message.content or "").strip()
         plan = _safe_json_loads(text)
         return _setdefaults(plan)
+
+    async def analyze_governor(self, message: str, personal_model: Optional[dict] = None) -> dict:
+        """Return governor guidance JSON (internal)."""
+        user_prompt = json.dumps(
+            {
+                "message": message,
+                "personal_model": personal_model or {},
+            },
+            ensure_ascii=False,
+        )
+
+        resp = await self.client.chat.completions.create(
+            model=GOVERNOR_MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": GOVERNOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        text = (resp.choices[0].message.content or "").strip()
+        out = _safe_json_loads(text) or {}
+
+        # Minimal defaults / type safety
+        try:
+            out["alignment_score"] = int(out.get("alignment_score", 50))
+        except Exception:
+            out["alignment_score"] = 50
+
+        if out.get("risk_pattern") not in {
+            "overengineering",
+            "project_switching",
+            "analysis_paralysis",
+            "avoidance",
+            "none",
+        }:
+            out["risk_pattern"] = "none"
+
+        if out.get("recommended_action") not in {"answer", "ask_question", "reframe", "push_back"}:
+            out["recommended_action"] = "answer"
+
+        try:
+            out["intervention_level"] = int(out.get("intervention_level", 0))
+        except Exception:
+            out["intervention_level"] = 0
+        out["intervention_level"] = max(0, min(2, out["intervention_level"]))
+
+        out["opening_line"] = (out.get("opening_line") or "").strip()[:140]
+        out["sharp_question"] = (out.get("sharp_question") or "").strip()[:200]
+        out["notes"] = (out.get("notes") or "").strip()[:120]
+
+        return out
+
+    async def extract_profile_update(self, message: str) -> dict:
+        """Detect durable profile updates from user message."""
+        resp = await self.client.chat.completions.create(
+            model=MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": PROFILE_EXTRACTOR_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+        )
+
+        text = (resp.choices[0].message.content or "").strip()
+        out = _safe_json_loads(text) or {}
+
+        field = str(out.get("field") or "").strip()
+        value = str(out.get("value") or "").strip()
+        try:
+            confidence = int(out.get("confidence", 0))
+        except Exception:
+            confidence = 0
+        override = bool(out.get("override", False))
+
+        if confidence < 75 or not field or not value:
+            return {"should_update": False}
+
+        # basic limits
+        field = field[:40]
+        value = value[:300]
+
+        return {
+            "should_update": True,
+            "field": field,
+            "value": value,
+            "override": override,
+            "confidence": confidence,
+        }
