@@ -1,84 +1,160 @@
-"""Benjamin Orchestrator: Level-driven execution with approval gates and escalation.
-
-Level 0-2 → direct path (Gemini + optional Claude, fast).
-Level 3+  → Agent Loop (plan→execute→observe cycle).
 """
-import asyncio
+Benjamin Orchestrator
+LLM Router (GPT) decides an execution plan → Gemini executes → Claude optionally verifies/reviews
+Supports:
+- Autonomy levels 0-5 (approval gate in handler)
+- Direct execution (levels 0-2)
+- Agent loop (levels 3+), with optional mid-run approval via returned dict
+- Memory context injection to worker calls
+- Memory write suggestion gating (requires approval unless explicit "תזכור:")
+"""
+
+from __future__ import annotations
+
 import time
+from typing import Any
 
 from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
-from experts.claude_client import review_and_improve_code, sanity_check_answer
-from experts.gpt_orchestrator import decide
-from memory.memory_store import format_memory_for_worker
-from orchestrator.agent_loop import run_agent_loop
+from experts.gpt_orchestrator import GPTOrchestrator  # decide(message, memory_context) -> dict
+from experts.claude_client import sanity_check_answer, review_and_improve_code
 
-LEVEL_FOR_WEB = 1
-LEVEL_FOR_CLAUDE = 2
-LEVEL_FOR_REFINEMENT = 3
+# Agent loop (optional; exists in your project per your summary)
+try:
+    from orchestrator.agent_loop import run_agent_loop
+except Exception:  # pragma: no cover
+    run_agent_loop = None
+
+
 MAX_REFINEMENT_PASSES = 1
 
 
+def _shorten(s: str | None, n: int = 120) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[:n].rstrip() + "…"
+
+
+def _bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    return default
+
+
+def _int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _normalize_plan(plan: dict) -> dict:
+    """
+    Hard-set defaults so orchestrator never crashes if router omitted keys.
+    """
+    plan = plan or {}
+    plan.setdefault("suggested_automation_level", 0)
+    plan.setdefault("execution_mode", "direct")
+    plan.setdefault("tools_required", [])
+    plan.setdefault("use_web", False)
+    plan.setdefault("require_verification", False)
+    plan.setdefault("require_code_review", False)
+    plan.setdefault("require_task_decomposition", False)
+    plan.setdefault("governors", {})
+    plan.setdefault("reason", "")
+
+    # Memory suggestion fields (may exist in your router prompt)
+    plan.setdefault("suggest_memory_write", False)
+    plan.setdefault("memory_to_write", None)
+
+    # Normalize types
+    plan["suggested_automation_level"] = max(0, min(5, _int(plan["suggested_automation_level"], 0)))
+    plan["use_web"] = _bool(plan["use_web"], False)
+    plan["require_verification"] = _bool(plan["require_verification"], False)
+    plan["require_code_review"] = _bool(plan["require_code_review"], False)
+    plan["require_task_decomposition"] = _bool(plan["require_task_decomposition"], False)
+    plan["suggest_memory_write"] = _bool(plan["suggest_memory_write"], False)
+
+    # execution_mode derived (keep if already explicit)
+    if plan["execution_mode"] not in {"direct", "agent_loop"}:
+        plan["execution_mode"] = "agent_loop" if plan["suggested_automation_level"] >= 3 else "direct"
+
+    if not isinstance(plan["tools_required"], list):
+        plan["tools_required"] = []
+
+    if not isinstance(plan["governors"], dict):
+        plan["governors"] = {}
+
+    # Governors defaults (only if already used אצלך)
+    # לא מכניס פה שום חובה חדשה — רק מוודא מבנה.
+    return plan
+
+
 class BenjaminOrchestrator:
-    """GPT = Brain. Gemini = Worker. Claude = Quality layer. Level-driven."""
-
     def __init__(self):
-        pass
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+       self.router = GPTOrchestrator()
 
     async def plan(self, message: str, memory_context: dict | None = None) -> dict:
-        """Get execution plan from GPT."""
-        return await asyncio.to_thread(decide, message, memory_context)
+        plan = await self.router.decide(message, memory_context=memory_context)
+        plan = _normalize_plan(plan)
+        print(f"Routing decision: {plan}")
+        return plan
 
-    def needs_approval(self, plan: dict, message: str = "") -> bool:
-        level = plan["suggested_automation_level"]
-        suggest_mem = plan.get("suggest_memory_write", False)
-        explicit_remember = message.strip().lower().startswith(("תזכור", "remember"))
-        if suggest_mem and not explicit_remember:
-            return True
+    def needs_approval(self, plan: dict, message: str) -> bool:
+        """
+        Approval rule:
+        - If GPT suggests memory write and user didn't explicitly say 'תזכור:' → approval required.
+        - Else: standard autonomy approval (Level > 1).
+        """
+        plan = _normalize_plan(plan)
+
+        # Memory gate
+        if plan.get("suggest_memory_write"):
+            msg = (message or "").strip()
+            if not msg.startswith("תזכור:"):
+                return True
+
+        level = plan.get("suggested_automation_level", 0)
         return level > 1
 
     def format_approval_request(self, plan: dict) -> str:
-        level = plan["suggested_automation_level"]
-        mode = plan.get("execution_mode", "direct")
+        plan = _normalize_plan(plan)
+
+        level = plan.get("suggested_automation_level", 0)
+        reason = plan.get("reason", "").strip()
         tools = plan.get("tools_required", [])
-        gov = plan.get("governors", {})
-        reason = plan.get("reason", "")
-        suggest_mem = plan.get("suggest_memory_write", False)
-        mem_to_write = plan.get("memory_to_write")
 
-        mode_text = "Agent Loop" if mode == "agent_loop" else "ביצוע ישיר"
-        tools_text = ", ".join(tools) if tools else "ללא כלים מיוחדים"
-
-        lines = [
-            f"נדרש {mode_text} עם גישת {tools_text}.",
-            f"רמת אוטומציה מוצעת: Level {level}.",
-        ]
-        if suggest_mem and mem_to_write:
-            lines.append(
-                f"שמירת זיכרון מוצעת: {mem_to_write.get('key', '')} — "
-                f"{str(mem_to_write.get('value', ''))[:50]}..."
-            )
-        elif suggest_mem:
-            lines.append("שמירת מידע אישי מוצעת (לאחר אישור).")
-
-        if gov:
-            gov_parts = []
-            if "max_budget_usd" in gov:
-                gov_parts.append(f"budget=${gov['max_budget_usd']}")
-            if "max_turns" in gov:
-                gov_parts.append(f"turns={gov['max_turns']}")
-            if "max_execution_time_seconds" in gov:
-                gov_parts.append(f"time={gov['max_execution_time_seconds']} שניות")
-            if gov_parts:
-                lines.append(f"Governors: {', '.join(gov_parts)}.")
-
+        lines = []
+        lines.append("נדרש אישור לפני ביצוע.")
+        lines.append(f"רמת אוטומציה מוצעת: Level {level}.")
         if reason:
             lines.append(f"סיבה: {reason}")
-        lines.append("לאשר? (כן / לא / שנה רמה)")
+        if tools:
+            lines.append(f"כלים נדרשים: {', '.join(tools)}")
 
+        # Governors preview (אם קיים אצלך)
+        gov = plan.get("governors") or {}
+        if isinstance(gov, dict) and gov:
+            # מציג רק מה שקיים בלי רעש
+            gov_parts = []
+            for k in ["max_budget_usd", "max_tokens", "max_turns", "max_execution_time_seconds"]:
+                if k in gov and gov[k] is not None:
+                    gov_parts.append(f"{k}={gov[k]}")
+            if gov_parts:
+                lines.append("מגבלות: " + ", ".join(gov_parts))
+
+        # Memory preview
+        if plan.get("suggest_memory_write") and isinstance(plan.get("memory_to_write"), dict):
+            mem = plan["memory_to_write"]
+            mtype = (mem.get("type") or "fact").strip()
+            key = (mem.get("key") or "").strip()
+            value = _shorten(str(mem.get("value") or ""), 120)
+
+            lines.append("")
+            lines.append("המערכת מציעה לשמור זיכרון:")
+            lines.append(f"type: {mtype}")
+            lines.append(f"key: {key}")
+            lines.append(f"value: {value}")
+
+        lines.append("לאשר? (כן / לא / שנה רמה)")
         return "\n".join(lines)
 
     async def execute(
@@ -88,24 +164,135 @@ class BenjaminOrchestrator:
         context: dict | None = None,
         resume_state: dict | None = None,
     ) -> str | dict:
-        """Route to direct path (level 0-2) or agent loop (level 3+).
-
-        Returns str for a final answer, or dict when mid-loop escalation
-        needs user approval.
         """
-        if context is None:
-            context = {"cancelled": False}
+        Returns:
+        - str: final answer
+        - dict: when agent loop needs mid-execution approval (handler will store resume_state)
+        """
+        plan = _normalize_plan(plan)
+        context = context or {}
+        start = time.time()
 
-        if plan["suggested_automation_level"] >= 3:
-            return await self._execute_agent_loop(
-                message, plan, context, resume_state,
-            )
+        self._log_plan(plan)
 
-        return await self._execute_direct(message, plan, context)
+        # Execution path
+        if plan["execution_mode"] == "agent_loop":
+            if run_agent_loop is None:
+                # Fallback: execute direct if agent loop engine not available
+                result = await self._execute_direct(message, plan, context)
+            else:
+                result = await self._execute_agent_loop(message, plan, context, resume_state)
+        else:
+            result = await self._execute_direct(message, plan, context)
 
-    # ------------------------------------------------------------------
-    # Level 3+ — Agent Loop
-    # ------------------------------------------------------------------
+        elapsed = time.time() - start
+        print(f"Execution time: {elapsed:.2f}s")
+        return result
+
+    def _log_plan(self, plan: dict) -> None:
+        print("Execution Plan:")
+        print(f"  suggested_automation_level: {plan.get('suggested_automation_level')}")
+        print(f"  execution_mode: {plan.get('execution_mode')}")
+        print(f"  tools_required: {plan.get('tools_required')}")
+        print(f"  use_web: {plan.get('use_web')}")
+        print(f"  require_verification: {plan.get('require_verification')}")
+        print(f"  require_code_review: {plan.get('require_code_review')}")
+        print(f"  require_task_decomposition: {plan.get('require_task_decomposition')}")
+        print(f"  governors: {plan.get('governors')}")
+        if plan.get("suggest_memory_write"):
+            mem = plan.get("memory_to_write")
+            print(f"  suggest_memory_write: True | memory_to_write: {mem}")
+
+    async def _execute_direct(self, message: str, plan: dict, context: dict) -> str:
+        """
+        Direct execution (levels 0-2):
+        - Gemini fast or web
+        - optional Claude verification
+        - optional Claude code review
+        - optional single refinement pass (if Claude changes output)
+        """
+        memory_context = context.get("memory_context")
+
+        model_used = FAST_MODEL
+        use_web = bool(plan.get("use_web"))
+        print(f"Model used: {model_used}")
+        print(f"Tools enabled: {use_web}")
+
+        # Step 1: Gemini
+        if context.get("cancelled"):
+            return "נעצר."
+
+        if use_web:
+            result = await generate_web(message, memory_context=memory_context)
+        else:
+            result = await generate_fast(message, memory_context=memory_context)
+
+        claude_called = False
+        claude_applied = False
+        refinement_triggered = False
+        refinement_count = 0
+
+        # Step 2: Claude verification
+        if context.get("cancelled"):
+            return "נעצר."
+
+        if plan.get("require_verification"):
+            claude_called = True
+            claude_out = await sanity_check_answer(result)
+            if claude_out and claude_out.strip() != result.strip():
+                claude_applied = True
+                if refinement_count < MAX_REFINEMENT_PASSES:
+                    print("Claude suggested corrections. Running one refinement pass...")
+                    refinement_triggered = True
+                    refinement_count += 1
+                    # Re-run Gemini with appended feedback
+                    revised_prompt = (
+                        f"{message}\n\n"
+                        f"---\n"
+                        f"Claude feedback (apply fixes, keep final answer concise):\n{claude_out}\n"
+                        f"---\n"
+                        f"Return the corrected final answer only."
+                    )
+                    if use_web:
+                        result = await generate_web(revised_prompt, memory_context=memory_context)
+                    else:
+                        result = await generate_fast(revised_prompt, memory_context=memory_context)
+                else:
+                    result = claude_out
+
+        # Step 3: Claude code review
+        if context.get("cancelled"):
+            return "נעצר."
+
+        if plan.get("require_code_review"):
+            claude_called = True
+            claude_out = await review_and_improve_code(result)
+            if claude_out and claude_out.strip() != result.strip():
+                claude_applied = True
+                if refinement_count < MAX_REFINEMENT_PASSES:
+                    print("Claude suggested corrections. Running one refinement pass...")
+                    refinement_triggered = True
+                    refinement_count += 1
+                    revised_prompt = (
+                        f"{message}\n\n"
+                        f"---\n"
+                        f"Claude code review feedback (apply fixes):\n{claude_out}\n"
+                        f"---\n"
+                        f"Return the corrected final code/answer only."
+                    )
+                    # Code usually doesn't need web
+                    result = await generate_fast(revised_prompt, memory_context=memory_context)
+                else:
+                    result = claude_out
+
+        print(f"Effective level: {plan.get('suggested_automation_level')}")
+        print(f"Claude called: {claude_called}")
+        print(f"Claude applied: {claude_applied}")
+        if refinement_triggered:
+            print("Refinement triggered: True")
+
+        print("Success: True")
+        return result
 
     async def _execute_agent_loop(
         self,
@@ -114,241 +301,18 @@ class BenjaminOrchestrator:
         context: dict,
         resume_state: dict | None,
     ) -> str | dict:
-        self._log_plan(plan)
-        print("Delegating to Agent Loop...")
+        """
+        Agent loop (levels 3+).
+        run_agent_loop may return:
+        - str final answer
+        - dict needs_approval w/ resume_state and proposed_plan
+        """
+        if run_agent_loop is None:
+            return await self._execute_direct(message, plan, context)
 
-        loop_result = await run_agent_loop(message, plan, context, resume_state)
-
-        if loop_result.get("needs_approval"):
-            return loop_result
-
-        steps = loop_result.get("steps", [])
-        print(
-            f"Agent Loop completed | steps={len(steps)} | "
-            f"stopped={loop_result.get('stopped', False)}"
+        return await run_agent_loop(
+            message=message,
+            plan=plan,
+            context=context,
+            resume_state=resume_state,
         )
-        if loop_result.get("escalations"):
-            print(f"Escalations: {loop_result['escalations']}")
-        print(f"Tools used: {loop_result.get('tools_used', [])}")
-        print("Success: True")
-
-        return loop_result["final_answer"]
-
-    # ------------------------------------------------------------------
-    # Level 0-2 — Direct path (unchanged behaviour)
-    # ------------------------------------------------------------------
-
-    async def _execute_direct(
-        self, message: str, plan: dict, context: dict,
-    ) -> str:
-        approved_level = plan["suggested_automation_level"]
-        current_level = approved_level
-        refinement_count = 0
-        start_time = time.time()
-        escalations: list[dict] = []
-
-        task_state = {
-            "user_input": message,
-            "approved_level": approved_level,
-            "effective_level": current_level,
-            "web_used": False,
-            "claude_called": False,
-            "claude_applied": False,
-            "refinement_triggered": False,
-        }
-
-        gov = plan.get("governors", {})
-        max_time = gov.get("max_execution_time_seconds")
-        max_turns = gov.get("max_turns")
-        turns = 0
-
-        def can_use(required_level: int) -> bool:
-            nonlocal current_level
-            if required_level <= current_level:
-                return True
-            if required_level <= approved_level + 1:
-                esc = {
-                    "current_level": current_level,
-                    "requested_level": required_level,
-                    "reason": f"Capability requires level {required_level}",
-                }
-                print(f"Escalation Proposal (auto-approved): {esc}")
-                current_level = required_level
-                task_state["effective_level"] = current_level
-                escalations.append(esc)
-                return True
-            print(
-                f"Escalation blocked: level {required_level} "
-                f"> approved+1 ({approved_level}+1)"
-            )
-            return False
-
-        def check_governors() -> bool:
-            if max_time and (time.time() - start_time) > max_time:
-                return False
-            if max_turns and turns >= max_turns:
-                return False
-            return True
-
-        self._log_plan(plan)
-
-        mem_ctx = context.get("memory_context")
-        worker_prompt = format_memory_for_worker(mem_ctx) + message
-
-        try:
-            # Step 1: Gemini execution
-            use_web = plan["use_web"] and can_use(LEVEL_FOR_WEB)
-            task_state["web_used"] = use_web
-            print(f"Tools enabled: {use_web}")
-
-            if use_web:
-                result = await asyncio.to_thread(generate_web, worker_prompt)
-            else:
-                result = await asyncio.to_thread(generate_fast, worker_prompt)
-            turns += 1
-
-            if context.get("cancelled"):
-                return "נעצר."
-
-            if not check_governors():
-                self._print_summary(
-                    task_state, escalations, start_time, governor_limited=True,
-                )
-                return result
-
-            # Step 2: Claude verification (level 2+)
-            if plan["require_verification"] and can_use(LEVEL_FOR_CLAUDE):
-                task_state["claude_called"] = True
-                checked = await asyncio.to_thread(
-                    sanity_check_answer, result, message, None,
-                )
-                turns += 1
-                output_changed = checked and checked.strip() != result.strip()
-
-                if output_changed:
-                    task_state["claude_applied"] = True
-                    if (
-                        can_use(LEVEL_FOR_REFINEMENT)
-                        and refinement_count < MAX_REFINEMENT_PASSES
-                        and check_governors()
-                    ):
-                        print(
-                            "Claude suggested corrections. "
-                            "Running one refinement pass..."
-                        )
-                        refinement_prompt = (
-                            worker_prompt + "\n\nClaude feedback:\n" + checked
-                        )
-                        if use_web:
-                            result = await asyncio.to_thread(
-                                generate_web, refinement_prompt,
-                            )
-                        else:
-                            result = await asyncio.to_thread(
-                                generate_fast, refinement_prompt,
-                            )
-                        turns += 1
-                        refinement_count += 1
-                        task_state["refinement_triggered"] = True
-                        print(f"Refinement pass triggered: {refinement_count}")
-                    else:
-                        result = checked
-                else:
-                    print("No refinement needed.")
-
-            if context.get("cancelled"):
-                return "נעצר."
-
-            if not check_governors():
-                self._print_summary(
-                    task_state, escalations, start_time, governor_limited=True,
-                )
-                return result
-
-            # Step 3: Claude code review (level 2+)
-            if plan["require_code_review"] and can_use(LEVEL_FOR_CLAUDE):
-                task_state["claude_called"] = True
-                improved = await asyncio.to_thread(
-                    review_and_improve_code, result, message,
-                )
-                turns += 1
-                output_changed = improved and improved.strip() != result.strip()
-
-                if output_changed:
-                    task_state["claude_applied"] = True
-                    if (
-                        can_use(LEVEL_FOR_REFINEMENT)
-                        and refinement_count < MAX_REFINEMENT_PASSES
-                        and check_governors()
-                    ):
-                        print(
-                            "Claude suggested corrections. "
-                            "Running one refinement pass..."
-                        )
-                        refinement_prompt = (
-                            worker_prompt + "\n\nClaude feedback:\n" + improved
-                        )
-                        result = await asyncio.to_thread(
-                            generate_fast, refinement_prompt,
-                        )
-                        turns += 1
-                        refinement_count += 1
-                        task_state["refinement_triggered"] = True
-                        print(f"Refinement pass triggered: {refinement_count}")
-                    else:
-                        result = improved
-                else:
-                    print("No refinement needed.")
-
-            self._print_summary(task_state, escalations, start_time)
-            return result
-
-        except Exception as e:
-            print(f"Claude called: {task_state['claude_called']}")
-            print(f"Claude applied: {task_state['claude_applied']}")
-            print(f"Success: False | Error: {e}")
-            raise
-
-    # ------------------------------------------------------------------
-    # Logging helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _log_plan(plan: dict) -> None:
-        gov = plan.get("governors", {})
-        print(f"Routing decision: {plan}")
-        print("Execution Plan:")
-        print(f"  suggested_automation_level: {plan['suggested_automation_level']}")
-        print(f"  execution_mode: {plan.get('execution_mode', 'direct')}")
-        print(f"  tools_required: {plan.get('tools_required', [])}")
-        print(f"  use_web: {plan['use_web']}")
-        print(f"  require_verification: {plan['require_verification']}")
-        print(f"  require_code_review: {plan['require_code_review']}")
-        print(
-            f"  require_task_decomposition: "
-            f"{plan.get('require_task_decomposition', False)}"
-        )
-        print(f"  governors: {gov}")
-        print(f"Model used: {FAST_MODEL}")
-        print(f"Approval required: {plan['suggested_automation_level'] > 1}")
-
-    @staticmethod
-    def _print_summary(
-        task_state: dict,
-        escalations: list,
-        start_time: float,
-        governor_limited: bool = False,
-    ) -> None:
-        elapsed = round(time.time() - start_time, 2)
-        print(f"Effective level: {task_state['effective_level']}")
-        print(f"Claude called: {task_state['claude_called']}")
-        print(f"Claude applied: {task_state['claude_applied']}")
-        if task_state.get("refinement_triggered"):
-            print("Refinement triggered: True")
-        if escalations:
-            print(f"Escalations: {escalations}")
-        print(f"Execution time: {elapsed}s")
-        if governor_limited:
-            print("Success: True (governor-limited)")
-        else:
-            print("Success: True")

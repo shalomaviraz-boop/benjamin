@@ -1,148 +1,238 @@
-"""GPT = Orchestrator Brain. Returns structured execution plan with autonomy level."""
+# experts/gpt_orchestrator.py
+"""
+GPT Orchestrator (Brain):
+Decides an execution plan + (optional) memory suggestion.
+Key rules:
+- suggest_memory_write is ONLY a suggestion (never auto-save without explicit "תזכור:")
+- memory_to_write must be either a structured object {type,key,value} or null
+- key must be <= 40 chars, clean, not a full sentence
+"""
+
+from __future__ import annotations
+
 import json
 import os
+import re
+from typing import Any, Dict, Optional
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-SYSTEM_PROMPT = """You are the routing brain of an AI super assistant.
-You DO NOT answer the user.
-You ONLY decide the execution plan.
-
-Automation Levels (strict):
-0 = No tools, no loops. Simple answer only. Greetings, static facts, general knowledge.
-1 = Read-only tools: web search allowed. Current info: prices, weather, news, exchange rates.
-2 = Quality layer: verification or code review by secondary model. Important answers, code generation.
-3 = Agent loop (limited): task decomposition, refinement passes, limited multi-step.
-4 = Semi-autonomous: multi-model, extended loops. Requires governors.
-5 = Fully autonomous: subtasks, multiple loops. Requires governors + kill switch.
-
-Decision rules:
-- Simple greetings, static knowledge, harmless conversation → level 0
-- Needs current/live data (prices, weather, news, "what is X right now") → level 1, use_web=true
-- Code generation or technical implementation → level 2, require_code_review=true
-- High-stakes topics requiring verification → level 2, require_verification=true, use_web=true
-- Multi-step tasks, complex analysis, decomposition needed → level 3, require_task_decomposition=true
-- Large research or project-level tasks → level 4-5
-
-Verification triggers (require_verification=true):
-- Financial transactions: transfer, invest, trade, buy, sell, העברה, השקעה, מסחר
-- Legal actions
-- Medical treatment or diagnosis
-- Step-by-step execution: "איך לבצע", "תן לי שלבים", "how to execute"
-- Irreversible: delete, cancel, transfer money, מחיקה, ביטול
-- Money movement
-- Verification requests: "תן לי מקורות", "בדוק", "אמת", "אימות", "האם נכון", "verify", "fact check"
-
-Memory suggestion (suggest_memory_write):
-- Set suggest_memory_write=true when the user message contains stable personal info worth remembering:
-  name, age, job, preferences, contact info, project names, important dates, etc.
-- If message starts with "תזכור" / "remember" → suggest_memory_write=true and fill memory_to_write:
-  type="fact", key=short topic (e.g. "name"), value=the fact text.
-- Otherwise, if you detect personal info → suggest_memory_write=true, memory_to_write=null (handler will extract).
-
-execution_mode:
-- "direct" for level 0-2
-- "agent_loop" for level 3-5
-
-Governor requirements:
-- Level 4-5 MUST include governors: max_budget_usd, max_turns, max_execution_time_seconds
-- Level 0-3: governors optional
-
-If unsure about level → choose 1.
-If unsure about use_web → set true.
-
-Return ONLY valid JSON."""
-
-USER_PROMPT_TEMPLATE = """{memory_block}Message: {message}
-
-Return JSON with:
-- suggested_automation_level (integer 0-5)
-- execution_mode ("direct" or "agent_loop")
-- tools_required (string array, e.g. ["web_search","verification","code_review"])
-- use_web (bool)
-- require_verification (bool)
-- require_code_review (bool)
-- require_task_decomposition (bool)
-- suggest_memory_write (bool)
-- memory_to_write (object or null: {{"type":"fact","key":"...","value":"..."}})
-- governors (object with optional: max_budget_usd, max_turns, max_execution_time_seconds)
-- reason (short string)
-No other text."""
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("GPT_ROUTER_MODEL", "gpt-4o-mini")
 
 
-def _format_memory_context(memory_context: dict | None) -> str:
-    """Format memory for router prompt: profile (max 10 lines), memories (max 8), project (max 10)."""
-    if not memory_context:
+def _clean_key(raw: str) -> str:
+    """Make a short stable key (<=40), no excessive whitespace, no long sentences."""
+    if not raw:
         return ""
-    lines = []
-    profile = memory_context.get("user_profile") or {}
-    if isinstance(profile, dict) and profile:
-        profile_str = json.dumps(profile, ensure_ascii=False)
-        for line in profile_str.split("\n")[:10]:
-            if line.strip():
-                lines.append(f"[Profile] {line.strip()}")
-    memories = memory_context.get("relevant_memories") or []
-    for m in memories[:8]:
-        if isinstance(m, dict):
-            k = m.get("key", "")
-            v = m.get("value", "")[:80]
-            lines.append(f"[Memory] {k}: {v}")
-        elif isinstance(m, str):
-            lines.append(f"[Memory] {m}")
-    state = memory_context.get("project_state") or {}
-    if isinstance(state, dict) and state:
-        state_str = json.dumps(state, ensure_ascii=False)
-        for line in state_str.split("\n")[:10]:
-            if line.strip():
-                lines.append(f"[Project] {line.strip()}")
-    if not lines:
-        return ""
-    return "Context about user:\n" + "\n".join(lines) + "\n\n"
+    k = str(raw).strip()
+
+    # collapse whitespace
+    k = re.sub(r"\s+", " ", k)
+
+    # remove surrounding quotes
+    k = k.strip('"\'')
+
+    # If it's clearly a sentence (too many words), take first 4-6 words
+    words = k.split(" ")
+    if len(words) > 6:
+        k = " ".join(words[:6])
+
+    # avoid trailing punctuation
+    k = k.strip(" .,:;!?-–—")
+
+    # final cap
+    if len(k) > 40:
+        k = k[:40].rstrip()
+
+    return k
 
 
-def decide(message: str, memory_context: dict | None = None) -> dict:
-    """Returns structured execution plan. Injects memory into prompt if provided."""
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def _validate_memory_obj(mem: Any) -> Optional[dict]:
+    """Return sanitized memory object or None."""
+    if not isinstance(mem, dict):
+        return None
 
-    memory_block = _format_memory_context(memory_context)
-    user_content = USER_PROMPT_TEMPLATE.format(
-        memory_block=memory_block,
-        message=message,
-    )
+    mtype = str(mem.get("type") or "").strip() or "fact"
+    key = _clean_key(mem.get("key") or "")
+    value = str(mem.get("value") or "").strip()
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        temperature=0,
-    )
-    text = response.choices[0].message.content.strip()
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0].strip()
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0].strip()
+    # hard rules
+    if not key or not value:
+        return None
+    if len(key) > 40:
+        key = key[:40].rstrip()
+    # prevent huge values
+    if len(value) > 500:
+        value = value[:500].rstrip() + "…"
 
-    plan = json.loads(text)
+    return {"type": mtype, "key": key, "value": value}
 
+
+def _safe_json_loads(s: str) -> dict:
+    # Try strict first
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+
+    # Fallback: extract first {...} block
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _setdefaults(plan: dict) -> dict:
     plan.setdefault("suggested_automation_level", 0)
-    plan.setdefault("execution_mode", "direct")
+    plan.setdefault("execution_mode", "direct")  # direct | agent_loop
     plan.setdefault("tools_required", [])
     plan.setdefault("use_web", False)
     plan.setdefault("require_verification", False)
     plan.setdefault("require_code_review", False)
     plan.setdefault("require_task_decomposition", False)
-    plan.setdefault("suggest_memory_write", False)
-    plan.setdefault("memory_to_write", None)
     plan.setdefault("governors", {})
     plan.setdefault("reason", "")
+    plan.setdefault("suggest_memory_write", False)
+    plan.setdefault("memory_to_write", None)
 
-    level = plan["suggested_automation_level"]
-    if level >= 4:
-        gov = plan["governors"]
-        gov.setdefault("max_budget_usd", 0.50)
-        gov.setdefault("max_turns", 10)
-        gov.setdefault("max_execution_time_seconds", 120)
+    # normalize types
+    try:
+        plan["suggested_automation_level"] = int(plan["suggested_automation_level"])
+    except Exception:
+        plan["suggested_automation_level"] = 0
+    plan["suggested_automation_level"] = max(0, min(5, plan["suggested_automation_level"]))
+
+    if plan["execution_mode"] not in ("direct", "agent_loop"):
+        plan["execution_mode"] = "agent_loop" if plan["suggested_automation_level"] >= 3 else "direct"
+
+    if not isinstance(plan["tools_required"], list):
+        plan["tools_required"] = []
+    plan["tools_required"] = [str(x) for x in plan["tools_required"] if x]
+
+    for b in ("use_web", "require_verification", "require_code_review", "require_task_decomposition", "suggest_memory_write"):
+        plan[b] = bool(plan.get(b))
+
+    if not isinstance(plan["governors"], dict):
+        plan["governors"] = {}
+
+    if not isinstance(plan["reason"], str):
+        plan["reason"] = str(plan["reason"])
+
+    # Governors defaults for higher autonomy (only if user approves later)
+    if plan["suggested_automation_level"] >= 4:
+        plan["governors"].setdefault("max_execution_time_seconds", 60)
+        plan["governors"].setdefault("max_turns", 8)
+    elif plan["suggested_automation_level"] == 3:
+        plan["governors"].setdefault("max_execution_time_seconds", 45)
+        plan["governors"].setdefault("max_turns", 6)
+
+    # Memory: must be structured or null
+    mem = _validate_memory_obj(plan.get("memory_to_write"))
+    plan["memory_to_write"] = mem
+    if not mem:
+        plan["suggest_memory_write"] = False
 
     return plan
+
+
+SYSTEM_PROMPT = """
+אתה ה-LLM Router של "בנימין" (עוזר אישי).
+המשימה שלך: להחזיר JSON בלבד (בלי טקסט נוסף) שמחליט איך לבצע את הבקשה.
+
+רמות אוטומציה (0-5):
+Level 0 – תשובה בלבד: אין כלים.
+Level 1 – כלים לקריאה בלבד: web_search/web_fetch. בלי כתיבה/בלי bash.
+Level 2 – איכות + אימות/Code review: שימוש ב-Claude verification / code_review. עדיין בלי bash.
+Level 3 – Agent Loop מוגבל: פירוק משימה + צעדים מרובים + refinement. (עדיין bash מוגבל אם קיים במערכת).
+Level 4 – חצי אוטונומי: לולאות יותר רחבות + השוואות/אופטימיזציות.
+Level 5 – אוטונומי מלא: research עמוק + שיפורים בלי לעצור (אבל תמיד יהיו governors).
+
+כללים:
+- ברירת מחדל שמרנית: אם לא צריך כלים/לולאה → Level 0.
+- אם צריך מידע עדכני/מזג אוויר/חדשות → use_web=true ולרוב Level 1.
+- אם הבקשה היא כתיבת קוד/בדיקת קוד/שיפור קוד → require_code_review=true ולרוב Level 2.
+- אם הבקשה מורכבת (ריבוי צעדים/תכנון/מחקר/בניית מערכת) → require_task_decomposition=true ולרוב Level 3+.
+- execution_mode:
+  - direct ל-Level 0-2
+  - agent_loop ל-Level 3-5
+
+Memory (חשוב!):
+- אתה רשאי רק "להציע" שמירת זיכרון.
+- אם אין משהו איכותי/ברור לשמור → suggest_memory_write=false ו-memory_to_write=null
+- אם מציע זיכרון: memory_to_write חייב להיות:
+  { "type": "fact"|"preference"|"note"|"project", "key": קצר וברור (<=40 תווים), "value": טקסט קצר }
+- אסור לייצר key ארוך/משפט. key חייב להיות "תגית" קצרה.
+
+החזר JSON בלבד בפורמט:
+{
+  "suggested_automation_level": 0-5,
+  "execution_mode": "direct"|"agent_loop",
+  "tools_required": [ ... ],
+  "use_web": bool,
+  "require_verification": bool,
+  "require_code_review": bool,
+  "require_task_decomposition": bool,
+  "governors": { "max_execution_time_seconds"?: int, "max_turns"?: int },
+  "reason": "מילה-שתיים למה",
+  "suggest_memory_write": bool,
+  "memory_to_write": { "type": "...", "key": "...", "value": "..." } | null
+}
+""".strip()
+
+
+def _build_user_prompt(message: str, memory_context: Optional[dict]) -> str:
+    mc = memory_context or {}
+    # keep these short; they are hints, not a full dump
+    user_profile = mc.get("user_profile")
+    relevant_memories = mc.get("relevant_memories") or []
+    project_state = mc.get("project_state")
+
+    def _clip(x: Any, n: int) -> str:
+        s = "" if x is None else str(x)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s[:n]
+
+    lines = []
+    if user_profile:
+        lines.append("USER_PROFILE: " + _clip(user_profile, 400))
+    if relevant_memories:
+        lines.append("RELEVANT_MEMORIES:")
+        for m in relevant_memories[:8]:
+            t = _clip(m.get("type", ""), 30)
+            k = _clip(m.get("key", ""), 60)
+            v = _clip(m.get("value", ""), 120)
+            lines.append(f"- ({t}) {k}: {v}")
+    if project_state:
+        lines.append("PROJECT_STATE: " + _clip(project_state, 400))
+
+    lines.append("USER_MESSAGE: " + message)
+    return "\n".join(lines)
+
+
+class GPTOrchestrator:
+    def __init__(self) -> None:
+        if not OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY not set in .env (required for GPT orchestrator)")
+        self.client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    async def decide(self, message: str, memory_context: Optional[dict] = None) -> dict:
+        user_prompt = _build_user_prompt(message, memory_context)
+
+        resp = await self.client.chat.completions.create(
+            model=MODEL,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        text = (resp.choices[0].message.content or "").strip()
+        plan = _safe_json_loads(text)
+        return _setdefaults(plan)
