@@ -6,6 +6,10 @@ from utils.helpers import extract_issues
 claude = ClaudeClient()
 gpt = GPTClient()
 
+
+def _is_hebrew(text: str) -> bool:
+    return any("\u0590" <= c <= "\u05FF" for c in text)
+
 MAX_ITERATIONS = 2
 
 
@@ -57,6 +61,7 @@ async def run(message: str) -> str:
         content=f"```python\n{code}\n```",
         expert_name="Claude",
         review=review,
+        force_hebrew=_is_hebrew(message),
     )
 
     return final

@@ -20,8 +20,12 @@ env/
 logs/*.log
 *.log
 
+# Memory
+benjamin_memory.db
+
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+.DS_Store

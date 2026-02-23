@@ -1,11 +1,12 @@
-"""Benjamin - Personal Assistant Bot. Main entry point."""
+"""Benjamin - GPT Orchestrator + Gemini Execution."""
+import asyncio
 import os
 
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))  # Before imports that need env
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))  # Before other imports
 
-from telegram import Update
+from telegram import Bot, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,18 +21,13 @@ handler = BenjaminMessageHandler()
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
-    await update.message.reply_text("👋 היי! אני בנימין, העוזר האישי שלך.")
-
+    await update.message.reply_text("👋 היי! אני בנימין.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle text messages."""
     if not update.message or not update.message.text:
         return
-
     message = update.message.text
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
-
     try:
         response = await handler.handle(message, user_id)
         await update.message.reply_text(response)
@@ -41,18 +37,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
-    """Run the bot."""
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
-        raise ValueError("TELEGRAM_TOKEN not set. Copy .env.example to .env and add your token.")
+        raise ValueError("TELEGRAM_TOKEN not set in .env")
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ValueError("GEMINI_API_KEY not set in .env")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise ValueError("OPENAI_API_KEY not set in .env (required for GPT orchestrator)")
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise ValueError("ANTHROPIC_API_KEY not set in .env (required for Claude worker)")
+
+    async def _cleanup() -> None:
+        bot = Bot(token=token)
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("⏳ ממתין 10 שניות...")
+        await asyncio.sleep(10)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_cleanup())
 
     app = Application.builder().token(token).build()
-
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 Benjamin bot started")
-    app.run_polling()
+    print("🤖 Benjamin bot started (GPT=Brain, Gemini=Worker)")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

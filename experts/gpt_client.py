@@ -102,9 +102,20 @@ ISSUES: [list 1-3 specific issues if NO, or "None"]
 
         raise Exception("All GPT models failed for sanity_check")
 
-    async def voice_pass(self, content: str, expert_name: str = "", review: str = "") -> str:
+    async def voice_pass(
+        self,
+        content: str,
+        expert_name: str = "",
+        review: str = "",
+        force_hebrew: bool = False,
+    ) -> str:
         """Final voice pass - make content sound natural and consistent."""
         review_part = f"\nReview: {review}" if review else ""
+        lang_rule = (
+            "CRITICAL: Answer ONLY in Hebrew. No English."
+            if force_hebrew
+            else "If the question/context is in Hebrew, answer in Hebrew. Match input language."
+        )
         prompt = f"""You are Benjamin's voice.
 
 Content from {expert_name}:
@@ -122,6 +133,7 @@ Your job:
 ❌ DO NOT add small talk
 
 Just answer directly. Keep ALL info from expert.
+{lang_rule}
 
 If content has timestamp/confidence - KEEP THEM!
 """
