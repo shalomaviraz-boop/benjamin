@@ -118,8 +118,10 @@ Your job:
 ❌ DO NOT summarize/shorten
 ❌ DO NOT remove important details
 ❌ DO NOT change facts
+❌ DO NOT add follow-up questions
+❌ DO NOT add small talk
 
-Keep ALL important info. Just make it sound natural and consistent.
+Just answer directly. Keep ALL info from expert.
 
 If content has timestamp/confidence - KEEP THEM!
 """

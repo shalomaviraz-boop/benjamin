@@ -30,14 +30,10 @@ class GeminiWeb:
 
         for model_name in MODELS:
             try:
-                # Try with google_search_retrieval tool (format varies by SDK version)
-                try:
-                    model = genai.GenerativeModel(
-                        model_name,
-                        tools=[{"google_search_retrieval": {}}],
-                    )
-                except (TypeError, ValueError):
-                    model = genai.GenerativeModel(model_name)
+                model = genai.GenerativeModel(
+                    model_name,
+                    tools="google_search_retrieval",
+                )
 
                 response = await asyncio.to_thread(model.generate_content, prompt)
 
