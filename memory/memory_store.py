@@ -2,6 +2,7 @@
 import os
 import sqlite3
 import time
+import json
 from typing import Any
 
 DB_PATH = os.getenv("BENJAMIN_MEMORY_DB", "benjamin_memory.db")
@@ -166,7 +167,6 @@ def upsert_project_state(user_id: str, state: dict | str) -> None:
 
 # ---------- Personal Model ----------
 
-
 def get_personal_model(user_id: str) -> dict | None:
     conn = _get_conn()
     try:
@@ -176,7 +176,11 @@ def get_personal_model(user_id: str) -> dict | None:
         ).fetchone()
         if not row or not row["model_json"]:
             return None
-        return {"model_json": row["model_json"]}
+        try:
+            data = json.loads(row["model_json"])
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
     finally:
         conn.close()
 
@@ -184,6 +188,10 @@ def get_personal_model(user_id: str) -> dict | None:
 def upsert_personal_model(user_id: str, model: dict | str) -> None:
     conn = _get_conn()
     try:
+        if isinstance(model, dict):
+            model_json = json.dumps(model, ensure_ascii=False)
+        else:
+            model_json = str(model)
         conn.execute(
             """
             INSERT INTO personal_model(user_id, model_json, updated_at)
@@ -192,7 +200,7 @@ def upsert_personal_model(user_id: str, model: dict | str) -> None:
               model_json=excluded.model_json,
               updated_at=excluded.updated_at
             """,
-            (user_id, str(model), _now_ts()),
+            (user_id, model_json, _now_ts()),
         )
         conn.commit()
     finally:
@@ -200,18 +208,8 @@ def upsert_personal_model(user_id: str, model: dict | str) -> None:
 
 
 def update_personal_model_field(user_id: str, field: str, value: Any) -> None:
-    """
-    Lightweight field update (expects model_json stored as dict-like string).
-    This keeps it simple for MVP.
-    """
-    existing = get_personal_model(user_id)
-    data = {}
-    if existing and existing.get("model_json"):
-        try:
-            data = eval(existing["model_json"])
-        except Exception:
-            data = {}
-
+    """Safe field update for personal model (JSON-backed)."""
+    data = get_personal_model(user_id) or {}
     data[str(field)] = value
     upsert_personal_model(user_id, data)
 
