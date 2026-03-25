@@ -4,6 +4,7 @@ import os
 import json
 import hashlib
 import sqlite3
+import re
 from pathlib import Path
 from experts.gemini_client import generate_web
 
@@ -191,6 +192,7 @@ async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
             "- בלי שאלות\n"
             "- בלי טקסט מחוץ ל-JSON\n"
             "- אם אין אירוע חשוב באמת: should_send=false\n"
+            "- אל תמציא אירועים. אם לא בטוח: should_send=false\n"
         )
 
         raw = await generate_web(prompt)
@@ -202,12 +204,21 @@ async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not should_send:
             return
 
+        # Only truly important events should be sent
+        severity = (data.get("severity") or "").strip().lower()
+        if severity not in {"high", "critical"}:
+            return
+
         category = (data.get("category") or "").strip()
         headline = (data.get("headline") or "").strip()
         summary = (data.get("summary") or "").strip()
         why_it_matters = (data.get("why_it_matters") or "").strip()
-        severity = (data.get("severity") or "").strip()
-        dedupe_key = (data.get("dedupe_key") or headline or summary).strip()
+        severity = severity
+        dedupe_key = (
+            (data.get("dedupe_key") or "").strip()
+            or re.sub(r"\s+", "", headline.lower())[:80]
+            or re.sub(r"\s+", "", summary.lower())[:80]
+        )
 
         if not headline or not summary or not dedupe_key:
             return
@@ -219,9 +230,9 @@ async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             prefix = "🚨 שוק" if category == "markets" else "🚨 AI" if category == "ai" else "🚨 עדכון"
 
-        text = f"{prefix}\n{headline}\n\n{summary}"
+        text = f"{prefix} | {headline}\n\n{summary}"
         if why_it_matters:
-            text += f"\n\nלמה זה חשוב: {why_it_matters}"
+            text += f"\n\n🎯 למה זה חשוב:\n{why_it_matters}"
 
         await context.bot.send_message(chat_id=chat_id, text=text)
         _mark_alert_sent(dedupe_key, category)
@@ -292,14 +303,14 @@ def main() -> None:
 
         app.job_queue.run_repeating(
             check_breaking_events,
-            interval=900,
+            interval=1800,
             first=120,
             data={"chat_id": default_chat_id},
             name="breaking_events_monitor",
         )
 
         print("📆 Proactive reports scheduled (09:00 / 15:30 / 23:50 Asia/Jerusalem)")
-        print("⚡ Breaking events monitor scheduled (every 15 minutes)")
+        print("⚡ Breaking events monitor scheduled (every 30 minutes)")
     else:
         print("⚠️ PROACTIVE_CHAT_ID not set – proactive mode disabled.")
 
