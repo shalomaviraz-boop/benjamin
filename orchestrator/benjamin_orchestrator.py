@@ -19,6 +19,7 @@ from agents.registry import registry as agent_registry
 from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
 from experts.gpt_orchestrator import GPTOrchestrator  # decide(message, memory_context) -> dict
 from experts.claude_client import sanity_check_answer, review_and_improve_code
+from utils.benjamin_identity import build_benjamin_user_prompt
 
 # Agent loop (optional; exists in your project per your summary)
 try:
@@ -601,10 +602,11 @@ class BenjaminOrchestrator:
         if context.get("cancelled"):
             return "נעצר."
 
+        benjamin_prompt = build_benjamin_user_prompt(message)
         if use_web:
-            result = await generate_web(message, memory_context=memory_context)
+            result = await generate_web(benjamin_prompt, memory_context=memory_context)
         else:
-            result = await generate_fast(message, memory_context=memory_context)
+            result = await generate_fast(benjamin_prompt, memory_context=memory_context)
 
         claude_called = False
         claude_applied = False
@@ -626,7 +628,7 @@ class BenjaminOrchestrator:
                     refinement_count += 1
                     # Re-run Gemini with appended feedback
                     revised_prompt = (
-                        f"{message}\n\n"
+                        f"{build_benjamin_user_prompt(message)}\n\n"
                         f"---\n"
                         f"Claude feedback (apply fixes, keep final answer concise):\n{claude_out}\n"
                         f"---\n"
@@ -653,7 +655,7 @@ class BenjaminOrchestrator:
                     refinement_triggered = True
                     refinement_count += 1
                     revised_prompt = (
-                        f"{message}\n\n"
+                        f"{build_benjamin_user_prompt(message)}\n\n"
                         f"---\n"
                         f"Claude code review feedback (apply fixes):\n{claude_out}\n"
                         f"---\n"

@@ -3,6 +3,7 @@
 from agents.agent_context import read_shared_context
 from agents.base_agent import BaseAgent
 from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
+from utils.benjamin_identity import build_benjamin_user_prompt
 
 
 class ExecutionAgent(BaseAgent):
@@ -28,10 +29,11 @@ class ExecutionAgent(BaseAgent):
             return result
 
         try:
+            prompt = build_benjamin_user_prompt(message)
             if use_web:
-                output = await generate_web(message, memory_context=memory_context)
+                output = await generate_web(prompt, memory_context=memory_context)
             else:
-                output = await generate_fast(message, memory_context=memory_context)
+                output = await generate_fast(prompt, memory_context=memory_context)
             result = {
                 "output": output,
                 "status": "success",
