@@ -14,6 +14,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from agents.agent_context import AgentContextState
+from agents.registry import registry as agent_registry
 from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
 from experts.gpt_orchestrator import GPTOrchestrator  # decide(message, memory_context) -> dict
 from experts.claude_client import sanity_check_answer, review_and_improve_code
@@ -26,6 +28,13 @@ except Exception:  # pragma: no cover
 
 
 MAX_REFINEMENT_PASSES = 1
+TASK_AGENT_MAP = {
+    "research": "research",
+    "memory": "memory",
+    "planning": "planning",
+    "execution": "execution",
+    "verification": "verification",
+}
 
 
 def _shorten(s: str | None, n: int = 120) -> str:
@@ -91,6 +100,7 @@ def _normalize_plan(plan: dict) -> dict:
 class BenjaminOrchestrator:
     def __init__(self):
        self.router = GPTOrchestrator()
+       self.agent_registry = agent_registry
 
     async def plan(self, message: str, memory_context: dict | None = None) -> dict:
         plan = await self.router.decide(message, memory_context=memory_context)
@@ -167,6 +177,238 @@ class BenjaminOrchestrator:
         lines.append("לאשר? (כן / לא / שנה רמה)")
         return "\n".join(lines)
 
+    def build_execution_plan(self, message: str, plan: dict, context: dict | None = None) -> dict:
+        """
+        Deterministic internal routing plan for multi-agent execution.
+        Keeps behavior understandable and stable.
+        """
+        context = context or {}
+        normalized = (message or "").strip().lower()
+
+        # Signals
+        is_memory_update = normalized.startswith("תזכור") or normalized.startswith("remember")
+        is_news_like = any(
+            k in normalized
+            for k in [
+                "news",
+                "breaking",
+                "market",
+                "markets",
+                "ai news",
+                "עדכ",
+                "חדשות",
+                "אירוע",
+                "שוק",
+                "מאקרו",
+            ]
+        ) or bool(plan.get("use_web"))
+        is_personal_context = any(
+            k in normalized
+            for k in [
+                "about me",
+                "what do you remember",
+                "זוכר עליי",
+                "זוכרת עליי",
+                "אישי",
+                "בשבילי",
+            ]
+        )
+        is_complex = bool(plan.get("require_task_decomposition")) or any(
+            k in normalized
+            for k in [
+                "architecture",
+                "refactor",
+                "design",
+                "plan",
+                "project",
+                "מימוש",
+                "תכנן",
+                "תוכנית",
+                "ארכיטקטורה",
+                "ריפקטור",
+            ]
+        )
+        is_quick_casual = (
+            len(normalized) < 70
+            and not is_memory_update
+            and not is_news_like
+            and not is_complex
+            and not bool(plan.get("require_verification") or plan.get("require_code_review"))
+        )
+        needs_verification = bool(plan.get("require_verification") or plan.get("require_code_review"))
+
+        use_memory = False
+        use_planning = False
+        use_research = False
+        use_execution = True
+        use_verification = False
+        reason = "default execution path"
+
+        if is_memory_update:
+            use_memory = True
+            use_execution = True
+            use_verification = False
+            reason = "memory update request"
+        elif is_news_like:
+            use_memory = True
+            use_research = True
+            use_execution = True
+            use_verification = needs_verification
+            reason = "factual/current-events/news-like request"
+        elif is_complex:
+            use_memory = True
+            use_planning = True
+            use_execution = True
+            use_verification = True if needs_verification or plan.get("execution_mode") == "agent_loop" else False
+            reason = "complex planning/project request"
+        elif is_personal_context:
+            use_memory = True
+            use_execution = True
+            use_verification = needs_verification
+            reason = "personal/contextual guidance request"
+        elif is_quick_casual:
+            use_memory = False
+            use_execution = True
+            use_verification = False
+            reason = "quick casual request"
+        else:
+            use_memory = bool(context.get("memory_context"))
+            use_execution = True
+            use_verification = needs_verification
+            reason = "general request with safe defaults"
+
+        sequence: list[str] = []
+        if use_memory:
+            sequence.append("memory")
+        if use_planning:
+            sequence.append("planning")
+        if use_research:
+            sequence.append("research")
+        if use_execution:
+            sequence.append("execution")
+        if use_verification:
+            sequence.append("verification")
+
+        execution_plan = {
+            "use_memory": use_memory,
+            "use_planning": use_planning,
+            "use_research": use_research,
+            "use_execution": use_execution,
+            "use_verification": use_verification,
+            "agent_sequence": sequence,
+            "reason": reason,
+        }
+        print(f"Agent routing plan: {execution_plan}")
+        return execution_plan
+
+    async def run_agent_sequence(
+        self,
+        message: str,
+        plan: dict,
+        context: dict | None,
+        execution_plan: dict,
+    ) -> str | None:
+        """
+        Run the selected agent sequence once (no autonomous loops).
+        Returns final text if successfully produced by agents, else None for fallback.
+        """
+        context = context or {}
+        sequence = execution_plan.get("agent_sequence") or []
+        if not isinstance(sequence, list) or not sequence:
+            return None
+
+        actual_ran: list[str] = []
+        shared = AgentContextState(
+            task=plan,
+            user_message=message,
+            memory_context=context.get("memory_context") if isinstance(context.get("memory_context"), dict) else {},
+            metadata={"routing_plan": execution_plan, "chosen_sequence": sequence},
+        )
+
+        for agent_name in sequence:
+            agent = self.agent_registry.get(agent_name)
+            if agent is None:
+                shared.add_log("orchestrator", f"{agent_name}: missing agent, skipped")
+                continue
+
+            run_fn = getattr(agent, "run", None)
+            if not callable(run_fn):
+                shared.add_log("orchestrator", f"{agent_name}: run() unavailable, skipped")
+                continue
+
+            task_payload = {
+                "type": agent_name,
+                "message": shared.user_message,
+                "original_message": message,
+                "plan": plan,
+                "draft_output": shared.execution_output.get("output") if isinstance(shared.execution_output, dict) else "",
+                "planning": shared.planning_output,
+                "agent_context": shared.to_dict(),
+            }
+            agent_context = {
+                "orchestrator_context": context,
+                "memory_context": shared.memory_context,
+                "agent_context": shared.to_dict(),
+            }
+
+            try:
+                result = await run_fn(task_payload, agent_context)
+                actual_ran.append(agent_name)
+            except NotImplementedError:
+                shared.add_log("orchestrator", f"{agent_name}: not implemented, skipped")
+                continue
+            except Exception as e:
+                shared.add_log("orchestrator", f"{agent_name}: error ({e}), skipped")
+                continue
+
+            if not isinstance(result, dict):
+                shared.add_log("orchestrator", f"{agent_name}: invalid result type, skipped")
+                continue
+
+            if isinstance(result.get("agent_context"), dict):
+                shared = AgentContextState.from_dict(result.get("agent_context"))
+            if agent_name == "planning":
+                shared.planning_output = result
+            elif agent_name == "execution":
+                out = result.get("output")
+                if isinstance(out, str):
+                    shared.execution_output = result
+                    shared.final_output = out
+            elif agent_name == "verification":
+                shared.verification_output = result
+                if isinstance(result.get("output"), str) and result.get("approved") is True:
+                    shared.final_output = result["output"]
+
+        print(f"Agents ran: {actual_ran}")
+        if shared.logs:
+            print(f"Agent context logs: {shared.logs}")
+        print(f"Agent context metadata: {shared.metadata}")
+
+        verification_output = shared.verification_output
+        if isinstance(verification_output, dict):
+            if verification_output.get("approved") is True:
+                out = verification_output.get("output")
+                if isinstance(out, str):
+                    return out
+            notes = verification_output.get("notes")
+            if isinstance(notes, str) and notes.strip():
+                return notes
+            return None
+
+        execution_out = shared.execution_output.get("output") if isinstance(shared.execution_output, dict) else ""
+        if isinstance(execution_out, str) and execution_out.strip():
+            return execution_out
+
+        planning_output = shared.planning_output
+        if isinstance(planning_output, dict):
+            objective = str(planning_output.get("objective") or "").strip()
+            steps = planning_output.get("steps") or []
+            if objective and isinstance(steps, list):
+                bullet_steps = "\n".join(f"- {str(s).strip()}" for s in steps if str(s).strip())
+                if bullet_steps:
+                    return f"מטרה: {objective}\n\nתוכנית:\n{bullet_steps}"
+        return None
+
     async def execute(
         self,
         message: str,
@@ -184,6 +426,12 @@ class BenjaminOrchestrator:
         start = time.time()
 
         self._log_plan(plan)
+        execution_plan = self.build_execution_plan(message, plan, context)
+        routed_result = await self.run_agent_sequence(message, plan, context, execution_plan)
+        if routed_result is not None:
+            elapsed = time.time() - start
+            print(f"Execution time: {elapsed:.2f}s")
+            return routed_result
 
         # Execution path
         if plan["execution_mode"] == "agent_loop":
@@ -198,6 +446,127 @@ class BenjaminOrchestrator:
         elapsed = time.time() - start
         print(f"Execution time: {elapsed:.2f}s")
         return result
+
+    def _resolve_task_type(self, message: str, plan: dict, context: dict) -> str | None:
+        explicit = (context.get("task_type") or plan.get("task_type") or "").strip().lower()
+        if explicit in TASK_AGENT_MAP:
+            return explicit
+
+        tools_required = [str(t).lower() for t in (plan.get("tools_required") or [])]
+        if any("memory" in t for t in tools_required) or plan.get("suggest_memory_write"):
+            return "memory"
+        if plan.get("require_task_decomposition"):
+            return "planning"
+        if plan.get("execution_mode") == "agent_loop":
+            return "execution"
+
+        msg = (message or "").lower()
+        if any(k in msg for k in ["research", "חקור", "בדוק מקורות", "market scan", "news scan"]):
+            return "research"
+        if any(k in msg for k in ["memory", "תזכור", "זכור"]):
+            return "memory"
+        if any(k in msg for k in ["plan", "תכנן", "תוכנית"]):
+            return "planning"
+        if any(k in msg for k in ["verify", "אמת", "בדיקת אמינות"]):
+            return "verification"
+        if any(k in msg for k in ["execute", "הרץ", "בצע"]):
+            return "execution"
+
+        return None
+
+    async def _try_run_specialized_agent(self, message: str, plan: dict, context: dict) -> str | dict | None:
+        task_type = self._resolve_task_type(message, plan, context)
+        if not task_type:
+            return None
+
+        agent_name = TASK_AGENT_MAP.get(task_type)
+        agent = self.agent_registry.get(agent_name) if agent_name else None
+        if agent is None:
+            return None
+
+        run_fn = getattr(agent, "run", None)
+        if not callable(run_fn):
+            return None
+
+        task_payload = {
+            "type": task_type,
+            "message": message,
+            "plan": plan,
+        }
+        agent_context = {
+            "orchestrator_context": context,
+            "memory_context": context.get("memory_context"),
+        }
+
+        try:
+            routed = await run_fn(task_payload, agent_context)
+        except NotImplementedError:
+            return None
+        except Exception as e:
+            print(f"Specialized agent '{agent_name}' failed, fallback to default flow: {e}")
+            return None
+
+        if not isinstance(routed, dict):
+            return None
+        if routed.get("status") == "not_implemented" or routed.get("should_fallback"):
+            return None
+        if task_type == "execution":
+            output = routed.get("output")
+            if not isinstance(output, str):
+                return None
+
+            need_verify = bool(plan.get("require_verification") or plan.get("require_code_review"))
+            if not need_verify:
+                return output
+
+            verifier = self.agent_registry.get("verification")
+            verify_fn = getattr(verifier, "run", None) if verifier else None
+            if not callable(verify_fn):
+                return output
+
+            verify_task = {
+                "type": "verification",
+                "message": message,
+                "original_message": message,
+                "draft_output": output,
+                "plan": plan,
+            }
+            try:
+                verified = await verify_fn(verify_task, agent_context)
+            except Exception as e:
+                print(f"Verification agent failed, returning execution output: {e}")
+                return output
+
+            if not isinstance(verified, dict):
+                return output
+            if verified.get("approved") is True:
+                verified_output = verified.get("output")
+                return verified_output if isinstance(verified_output, str) else output
+            notes = verified.get("notes")
+            if isinstance(notes, str) and notes.strip():
+                return notes
+            return "הפלט לא עבר אימות."
+        if task_type == "verification":
+            if routed.get("approved") is True and isinstance(routed.get("output"), str):
+                return routed["output"]
+            notes = routed.get("notes")
+            if isinstance(notes, str) and notes.strip():
+                return notes
+            return None
+        if isinstance(routed.get("final_answer"), str):
+            return routed["final_answer"]
+        if isinstance(routed.get("result"), str):
+            return routed["result"]
+        if isinstance(routed.get("output"), str):
+            return routed["output"]
+        if task_type == "planning":
+            objective = str(routed.get("objective") or "").strip()
+            steps = routed.get("steps") or []
+            if objective and isinstance(steps, list):
+                bullet_steps = "\n".join(f"- {str(s).strip()}" for s in steps if str(s).strip())
+                if bullet_steps:
+                    return f"מטרה: {objective}\n\nתוכנית:\n{bullet_steps}"
+        return None
 
     def _log_plan(self, plan: dict) -> None:
         print("Execution Plan:")
