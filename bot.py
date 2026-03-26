@@ -29,9 +29,6 @@ from zoneinfo import ZoneInfo
 
 handler = BenjaminMessageHandler()
 
-# --- Proactive state ---
-_STATE_DB_PATH = Path(__file__).resolve().parent / "proactive_state.db"
-
 
 def _state_conn():
     conn = sqlite3.connect(_STATE_DB_PATH)
@@ -105,6 +102,49 @@ def _extract_json_object(text: str) -> dict:
         return {}
 
 
+# --- Breaking Alerts Verification ---
+
+def _normalize_cluster_key(category: str, cluster: str, headline: str) -> str:
+    cat = (category or "").strip().lower()
+    cl = re.sub(r"\s+", "", (cluster or "").strip().lower())[:80]
+    hl = re.sub(r"\s+", "", (headline or "").strip().lower())[:80]
+    return f"{cat}:{cl or hl}"
+
+
+async def _verify_breaking_candidate(raw_candidate: str) -> dict:
+    """Second-pass verification gate for breaking alerts."""
+    prompt = (
+        "אתה שכבת אימות להתראות חדשות. קיבלת טיוטת JSON של אירוע אפשרי.\n"
+        "המטרה שלך: להחזיר JSON מאומת בלבד, ולפסול כל דבר לא ודאי, כפול או ספקולטיבי.\n"
+        "\n"
+        "האירוע לבדיקה:\n"
+        f"{raw_candidate}\n"
+        "\n"
+        "החזר JSON בלבד בפורמט הזה:\n"
+        "{\n"
+        "  \"should_send\": true/false,\n"
+        "  \"category\": \"markets\" | \"ai\" | \"\",\n"
+        "  \"headline\": \"כותרת קצרה בעברית\",\n"
+        "  \"summary\": \"2-3 שורות בעברית, חד וברור\",\n"
+        "  \"why_it_matters\": \"שורה אחת בעברית\",\n"
+        "  \"severity\": \"high\" | \"critical\" | \"\",\n"
+        "  \"confidence\": 0-100,\n"
+        "  \"source_count\": 0-10,\n"
+        "  \"event_cluster\": \"תגית קצרה ויציבה לאירוע\",\n"
+        "  \"dedupe_key\": \"מזהה קצר ויציב לאירוע\"\n"
+        "}\n"
+        "\n"
+        "כללים קשיחים:\n"
+        "- אל תמציא עובדות או חברות או מספרים.\n"
+        "- אם אין ודאות גבוהה: should_send=false.\n"
+        "- אם נראה שזה אותו אירוע שכבר יכול להישלח שוב בניסוח אחר, החזר event_cluster יציב.\n"
+        "- שלח התראה רק אם confidence>=85 וגם source_count>=2.\n"
+        "- בלי טקסט מחוץ ל-JSON.\n"
+    )
+    raw = await generate_web(prompt)
+    return _extract_json_object(raw)
+
+
 # --- Proactive Daily Jobs ---
 
 async def send_us_market_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,6 +202,7 @@ async def send_proactive_report(context: ContextTypes.DEFAULT_TYPE) -> None:
         print(f"Proactive report job error: {e}")
 
 
+
 async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Checks for important breaking US markets / AI events and pushes immediately."""
     try:
@@ -170,12 +211,10 @@ async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         prompt = (
-            "בדוק אם קרה ממש עכשיו אירוע מהותי באמת שמצדיק התראה מיידית למשתמש.\n"
+            "אתר אם קרה ממש עכשיו אירוע חריג ומשמעותי באמת שמצדיק התראה מיידית.\n"
             "התמקד רק ב-2 תחומים:\n"
             "1. שוקי ארה״ב / מקרו / מדדים / תשואות / נפט / אירוע שוק חריג\n"
             "2. AI - הכרזה גדולה, השקה משמעותית, מימון גדול, רגולציה חשובה, מהלך של OpenAI/Google/Anthropic/Meta/Nvidia\n"
-            "\n"
-            "שלח התראה רק אם מדובר באירוע חריג ומשמעותי באמת, לא רעש יומי.\n"
             "\n"
             "החזר JSON בלבד בפורמט הזה:\n"
             "{\n"
@@ -185,39 +224,44 @@ async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
             "  \"summary\": \"2-3 שורות בעברית, חד וברור\",\n"
             "  \"why_it_matters\": \"שורה אחת בעברית\",\n"
             "  \"severity\": \"high\" | \"critical\" | \"\",\n"
+            "  \"event_cluster\": \"תגית קצרה ויציבה לאירוע\",\n"
             "  \"dedupe_key\": \"מזהה קצר ויציב לאירוע\"\n"
             "}\n"
             "\n"
-            "חוקים:\n"
-            "- בלי שאלות\n"
-            "- בלי טקסט מחוץ ל-JSON\n"
-            "- אם אין אירוע חשוב באמת: should_send=false\n"
-            "- אל תמציא אירועים. אם לא בטוח: should_send=false\n"
+            "כללים:\n"
+            "- בלי שאלות.\n"
+            "- בלי טקסט מחוץ ל-JSON.\n"
+            "- אם אין אירוע חשוב באמת: should_send=false.\n"
+            "- אל תמציא אירועים. אם לא בטוח: should_send=false.\n"
+            "- החזר רק אירוע אחד לכל ריצה: החשוב ביותר כרגע.\n"
         )
 
-        raw = await generate_web(prompt)
-        data = _extract_json_object(raw)
-        if not data:
+        raw_candidate = await generate_web(prompt)
+        candidate = _extract_json_object(raw_candidate)
+        if not candidate or not bool(candidate.get("should_send")):
             return
 
-        should_send = bool(data.get("should_send"))
-        if not should_send:
+        verified = await _verify_breaking_candidate(raw_candidate)
+        if not verified or not bool(verified.get("should_send")):
             return
 
-        # Only truly important events should be sent
-        severity = (data.get("severity") or "").strip().lower()
+        confidence = int(verified.get("confidence") or 0)
+        source_count = int(verified.get("source_count") or 0)
+        severity = (verified.get("severity") or "").strip().lower()
+        if confidence < 85 or source_count < 2:
+            return
         if severity not in {"high", "critical"}:
             return
 
-        category = (data.get("category") or "").strip()
-        headline = (data.get("headline") or "").strip()
-        summary = (data.get("summary") or "").strip()
-        why_it_matters = (data.get("why_it_matters") or "").strip()
-        severity = severity
+        category = (verified.get("category") or "").strip()
+        headline = (verified.get("headline") or "").strip()
+        summary = (verified.get("summary") or "").strip()
+        why_it_matters = (verified.get("why_it_matters") or "").strip()
+        event_cluster = (verified.get("event_cluster") or "").strip()
+
         dedupe_key = (
-            (data.get("dedupe_key") or "").strip()
-            or re.sub(r"\s+", "", headline.lower())[:80]
-            or re.sub(r"\s+", "", summary.lower())[:80]
+            (verified.get("dedupe_key") or "").strip()
+            or _normalize_cluster_key(category, event_cluster, headline)
         )
 
         if not headline or not summary or not dedupe_key:
@@ -236,7 +280,9 @@ async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await context.bot.send_message(chat_id=chat_id, text=text)
         _mark_alert_sent(dedupe_key, category)
-        print(f"Breaking alert sent: {category} | {headline}")
+        print(
+            f"Breaking alert sent: {category} | {headline} | confidence={confidence} | sources={source_count}"
+        )
 
     except Exception as e:
         print(f"Breaking events job error: {e}")
@@ -303,14 +349,14 @@ def main() -> None:
 
         app.job_queue.run_repeating(
             check_breaking_events,
-            interval=1800,
+            interval=3600,
             first=120,
             data={"chat_id": default_chat_id},
             name="breaking_events_monitor",
         )
 
         print("📆 Proactive reports scheduled (09:00 / 15:30 / 23:50 Asia/Jerusalem)")
-        print("⚡ Breaking events monitor scheduled (every 30 minutes)")
+        print("⚡ Breaking events monitor scheduled (every 60 minutes, with verification gate)")
     else:
         print("⚠️ PROACTIVE_CHAT_ID not set – proactive mode disabled.")
 
@@ -323,3 +369,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+registry = AgentRegistry()
+registry.register("research", ResearchAgent())
+registry.register("breaking", BreakingAgent())
+registry.register("quality", QualityAgent())
+
+
+registry = AgentRegistry()
+registry.register("research", ResearchAgent())
+registry.register("breaking", BreakingAgent())
+registry.register("quality", QualityAgent())
