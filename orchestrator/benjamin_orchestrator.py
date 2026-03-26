@@ -434,19 +434,9 @@ class BenjaminOrchestrator:
             print(f"Execution time: {elapsed:.2f}s")
             return routed_result
 
-        # Execution path
-        if plan["execution_mode"] == "agent_loop":
-            if run_agent_loop is None:
-                # Fallback: execute direct if agent loop engine not available
-                result = await self._execute_direct(message, plan, context)
-            else:
-                result = await self._execute_agent_loop(message, plan, context, resume_state)
-        else:
-            result = await self._execute_direct(message, plan, context)
-
         elapsed = time.time() - start
         print(f"Execution time: {elapsed:.2f}s")
-        return result
+        return "מצטער, לא הצלחתי להשלים את הבקשה כרגע. נסה לנסח מחדש בקצרה."
 
     def _resolve_task_type(self, message: str, plan: dict, context: dict) -> str | None:
         explicit = (context.get("task_type") or plan.get("task_type") or "").strip().lower()
