@@ -5,16 +5,7 @@ from experts.gemini_client import generate_web
 
 class AIExpertAgent(BaseAgent):
     def __init__(self):
-        super().__init__(
-            name="ai_expert",
-            system_prompt=(
-                "You are a world-class AI expert with 40 years of experience in artificial intelligence and machine learning. "
-                "You deeply understand language models, AI systems, tools, agents, prompting, model capabilities, tradeoffs, "
-                "integrations, and real-world use cases. "
-                "You explain clearly, sharply, practically, and without generic fluff. "
-                "You also track major AI updates from OpenAI, Anthropic, Google, Meta, xAI, Mistral and others."
-            ),
-        )
+        super().__init__(name="ai_expert")
 
     async def run(self, message: str, context: dict | None = None):
         context = context or {}
@@ -30,19 +21,21 @@ class AIExpertAgent(BaseAgent):
 
         if is_news:
             prompt = (
-                "ענה בעברית. מדובר בבקשת חדשות AI ולכן תביא רק מידע עדכני ורלוונטי. "
-                "תן 3 עד 5 עדכונים הכי חשובים. "
-                "לכל סעיף ציין תאריך, מה יצא, מה זה עושה, ולמה זה חשוב. "
-                "בלי מידע ישן ובלי חפירות.\n\n"
-                f"בקשת המשתמש: {message}"
+                "You are a world-class AI expert with 40 years of experience in artificial intelligence and machine learning. "
+                "Answer in Hebrew. This is an AI news/update request, so return only current and relevant information. "
+                "Give 3 to 5 key updates. For each one include: explicit date, what was released, what it does, and why it matters. "
+                "Be sharp, practical, and non-generic. No old background and no fluff.\n\n"
+                f"User request: {message}"
             )
             output = await generate_web(prompt, web_mode="news")
         else:
             prompt = (
-                "ענה בעברית כמומחה AI בכיר. "
-                "תהיה קצר, חד, פרקטי ולא גנרי. "
-                "אם צריך השוואה בין מודלים/כלים תן המלצה ברורה.\n\n"
-                f"בקשת המשתמש: {message}"
+                "You are a world-class AI expert with 40 years of experience in artificial intelligence and machine learning. "
+                "You deeply understand language models, AI systems, tools, agents, prompting, model capabilities, tradeoffs, "
+                "integrations, and real-world use cases. "
+                "Answer in Hebrew. Be sharp, practical, clear, and non-generic. "
+                "If relevant, compare models/tools and give a clear recommendation.\n\n"
+                f"User request: {message}"
             )
             output = await generate_web(prompt, web_mode="research")
 
