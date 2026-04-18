@@ -57,6 +57,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("👋 היי! אני בנימין.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    print("BENJAMIN ENTRY ACTIVE")
     if not update.message or not update.message.text:
         return
     message = update.message.text
@@ -91,6 +92,7 @@ def main() -> None:
     loop.run_until_complete(_cleanup())
 
     app = Application.builder().token(token).build()
+    print(f"Runtime entry file: {__file__}")
 
     # --- Scheduler setup ---
     tz = ZoneInfo("Asia/Jerusalem")
@@ -124,7 +126,9 @@ def main() -> None:
         print("⚠️ PROACTIVE_CHAT_ID not set – proactive mode disabled.")
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    text_handler = TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    app.add_handler(text_handler)
+    print("Registered update handlers: /start + TEXT(non-command) (single text handler)")
 
     print("🤖 Benjamin bot started (GPT=Brain, Gemini=Worker)")
     app.run_polling(drop_pending_updates=True)
