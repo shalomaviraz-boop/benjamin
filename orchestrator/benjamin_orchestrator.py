@@ -50,6 +50,7 @@ TASK_AGENT_MAP = {
     "fitness_health": "fitness_health",
     "relationships": "relationships",
     "business_strategy": "business_strategy",
+    "ai_expert": "ai_expert",
 }
 
 
@@ -540,6 +541,8 @@ class BenjaminOrchestrator:
             return "relationships"
         if any(k in msg for k in ["business", "strategy", "offer", "pricing", "gtm", "growth", "עסק", "אסטרטגיה", "הצעה", "מוצר", "לקוחות", "מכירות", "מוניטיזציה"]):
             return "business_strategy"
+        if any(k in msg for k in ["ai", "artificial intelligence", "machine learning", "llm", "gpt", "claude", "gemini", "anthropic", "openai", "מודל", "מודלים", "בינה מלאכותית", "למידת מכונה", "אייגנט", "אייגנטים"]):
+            return "ai_expert"
 
         return None
 

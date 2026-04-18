@@ -80,6 +80,13 @@ DEFAULT_AGENT_CAPABILITIES = {
         "read_only": False,
         "write_capable": True,
     },
+    "ai_expert": {
+        "description": "AI, machine learning, language models, AI tools, model comparisons, AI product updates, and important AI news with practical explanation.",
+        "can_handle": ["ai", "machine_learning", "llm", "models", "agents", "prompting", "ai_tools", "ai_news", "model_comparison"],
+        "tools_required": ["llm", "web", "files", "memory_db"],
+        "read_only": False,
+        "write_capable": True,
+    },
     "breaking": {
         "description": "Proactive breaking-alert pipeline.",
         "can_handle": ["alerts", "breaking_news"],

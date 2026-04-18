@@ -2,6 +2,7 @@
 
 from agents.agent_capabilities import DEFAULT_AGENT_CAPABILITIES
 from agents.assistant_agent import AssistantAgent
+from agents.ai_expert_agent import AIExpertAgent
 from agents.breaking_agent import BreakingAgent
 from agents.business_strategy_agent import BusinessStrategyAgent
 from agents.base_agent import BaseAgent
@@ -67,6 +68,7 @@ def build_default_registry() -> AgentRegistry:
     registry.register("fitness_health", FitnessHealthAgent())
     registry.register("relationships", RelationshipsAgent())
     registry.register("business_strategy", BusinessStrategyAgent())
+    registry.register("ai_expert", AIExpertAgent())
     registry.register("breaking", BreakingAgent())
     registry.register("quality", QualityAgent())
     registry.register("priority", PriorityAgent())

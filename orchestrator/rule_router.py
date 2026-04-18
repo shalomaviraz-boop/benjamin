@@ -71,6 +71,16 @@ class RuleRouter:
                 "reason": "business strategy request matched rule router",
             }
 
+        if any(x in text for x in ["ai", "artificial intelligence", "machine learning", "llm", "gpt", "claude", "gemini", "anthropic", "openai", "מודל", "מודלים", "בינה מלאכותית", "למידת מכונה", "אייגנט", "אייגנטים"]):
+            return {
+                "task_type": "ai_expert",
+                "routing_source": "rule",
+                "execution_mode": "direct",
+                "use_web": True,
+                "require_verification": True,
+                "reason": "ai expert request matched rule router",
+            }
+
         if any(x in text for x in ["עצור", "בטל", "אשר", "תאשר", "approve", "cancel", "stop"]):
             return {
                 "task_type": "execution",
