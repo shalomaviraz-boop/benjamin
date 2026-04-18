@@ -8,7 +8,23 @@ from google.genai import types
 FAST_MODEL = "gemini-3-flash-preview"
 SEARCH_MODEL = "gemini-3-flash-preview"
 
+
 _client = None
+
+WEB_MODE_PREFIXES = {
+    "news": (
+        "CRITICAL: This is a latest-news query. Use Google Search and return only current, recent, date-specific information. "
+        "Do not rely on stale knowledge. Include explicit dates for each major item. Ignore old background unless directly needed."
+    ),
+    "market": (
+        "CRITICAL: This is a market/current-status query. Use Google Search and return only current, date-specific information. "
+        "Do not rely on stale knowledge. If data timing is unclear, say so explicitly."
+    ),
+    "research": (
+        "Use Google Search when needed and prioritize up-to-date, source-backed information. "
+        "If certainty is limited, say so explicitly."
+    ),
+}
 
 
 def get_client():
@@ -147,17 +163,53 @@ def _generate_fast_sync(contents: str) -> str:
     return response.text or ""
 
 
-def _generate_web_sync(contents: str) -> str:
+
+def _extract_grounding_sources(response) -> list[str]:
+    sources: list[str] = []
+
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            grounding = getattr(candidate, "grounding_metadata", None)
+            if not grounding:
+                continue
+
+            chunks = getattr(grounding, "grounding_chunks", None) or []
+            for chunk in chunks:
+                web = getattr(chunk, "web", None)
+                if not web:
+                    continue
+                uri = getattr(web, "uri", None)
+                if uri and uri not in sources:
+                    sources.append(uri)
+    except Exception:
+        return sources
+
+    return sources
+
+
+def _generate_web_sync(contents: str, web_mode: str = "research") -> str:
     client = get_client()
+    mode = (web_mode or "research").strip().lower()
+    prefix = WEB_MODE_PREFIXES.get(mode, WEB_MODE_PREFIXES["research"])
+    final_contents = f"{prefix}\n\n{contents}"
+
     config = types.GenerateContentConfig(
         tools=[types.Tool(google_search=types.GoogleSearch())]
     )
     response = client.models.generate_content(
         model=SEARCH_MODEL,
-        contents=contents,
+        contents=final_contents,
         config=config,
     )
-    return response.text or ""
+
+    text = response.text or ""
+    sources = _extract_grounding_sources(response)
+    if sources:
+        source_lines = "\n".join(f"- {src}" for src in sources[:5])
+        text = f"{text}\n\nמקורות:\n{source_lines}" if text else f"מקורות:\n{source_lines}"
+
+    return text
 
 
 async def generate_fast(
@@ -176,6 +228,7 @@ async def generate_fast(
 async def generate_web(
     contents: str,
     memory_context: str | None = None,
+    web_mode: str = "research",
     **kwargs,
 ) -> str:
     """
@@ -183,4 +236,4 @@ async def generate_web(
     Accepts extra kwargs for signature unification.
     """
     contents = _inject_memory(contents, memory_context)
-    return await asyncio.to_thread(_generate_web_sync, contents)
+    return await asyncio.to_thread(_generate_web_sync, contents, web_mode)

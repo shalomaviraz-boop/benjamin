@@ -8,6 +8,42 @@ from agents.base_agent import BaseAgent
 from experts.gemini_client import generate_web
 
 
+NEWS_KEYWORDS = [
+    "חדשות", "עדכונים", "אחרונות", "אחרונים", "מה חדש", "מה קורה", "היום",
+    "latest", "news", "current", "recent", "today", "update", "updates",
+]
+
+
+def _is_news_query(message: str) -> bool:
+    msg = (message or "").lower()
+    return any(keyword in msg for keyword in NEWS_KEYWORDS)
+
+
+def _build_research_prompt(message: str) -> str:
+    if _is_news_query(message):
+        return (
+            "ענה בעברית, קצר, חד ומדויק. מדובר בבקשת חדשות/עדכונים ולכן חובה להחזיר מידע עדכני בלבד מהווב.\n"
+            "חוקים מחייבים:\n"
+            "- תביא רק 3 עד 5 עדכונים הכי חשובים ורלוונטיים\n"
+            "- לכל עדכון חובה לציין תאריך מפורש\n"
+            "- אל תביא מידע ישן או רקע היסטורי אם לא התבקש\n"
+            "- אם אין ודאות או שהמידע לא עדכני מספיק, תגיד זאת במפורש\n"
+            "- בלי הקדמה כללית ובלי חפירות\n"
+            "- התחל ישר מהעדכונים\n"
+            "- בסוף תן שורת סיכום אחת: למה זה חשוב\n\n"
+            f"בקשת המשתמש: {message}"
+        )
+
+    return (
+        "ענה בעברית בצורה קצרה, חדה ומבוססת מקורות עדכניים.\n"
+        "חוקים:\n"
+        "- אם השאלה נוגעת למידע עדכני, חובה להסתמך על ווב עדכני\n"
+        "- אם חסר מידע ודאי תגיד זאת\n"
+        "- בלי הקדמות מיותרות\n\n"
+        f"בקשת המשתמש: {message}"
+    )
+
+
 class ResearchAgent(BaseAgent):
     def __init__(self):
         super().__init__("research", "Researches current information and web-grounded answers.")
@@ -58,17 +94,13 @@ class ResearchAgent(BaseAgent):
             result["agent_context"] = shared.to_dict()
             return result
 
-        prompt = (
-            "ענה בעברית בצורה קצרה, חדה ומבוססת מקורות עדכניים. "
-            "אם חסר מידע ודאי תגיד זאת.\n\n"
-            f"בקשת המשתמש: {message}"
-        )
+        prompt = _build_research_prompt(message)
         try:
             output = await generate_web(prompt, memory_context=shared.memory_context or (context or {}).get("memory_context"))
             result = build_agent_result(
                 agent=self.name,
                 output=output,
-                notes="web research completed",
+                notes="news research completed" if _is_news_query(message) else "web research completed",
                 agent_context=shared.to_dict(),
             )
             shared.research_output = result
