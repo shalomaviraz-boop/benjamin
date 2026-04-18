@@ -1,6 +1,7 @@
 """Logging configuration for Benjamin."""
 import logging
 import os
+from typing import Any
 
 # Ensure logs directory exists
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
@@ -22,3 +23,8 @@ def log_pipeline(pipeline: str, message: str, result: bool) -> None:
     """Log pipeline execution."""
     msg_preview = message[:50] + "..." if len(message) > 50 else message
     logger.info(f"Pipeline: {pipeline} | Message: {msg_preview} | Success: {bool(result)}")
+
+
+def log_orchestration(event: str, **fields: Any) -> None:
+    payload = " | ".join(f"{key}={fields[key]}" for key in sorted(fields))
+    logger.info(f"Orchestration: {event}" + (f" | {payload}" if payload else ""))

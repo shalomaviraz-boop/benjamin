@@ -2,10 +2,16 @@
 
 from telegram.ext import ContextTypes
 
+from agents.agent_context import read_shared_context
+from agents.agent_contract import build_agent_result
+from agents.base_agent import BaseAgent
 from experts.gemini_client import generate_web
 
 
-class ResearchAgent:
+class ResearchAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("research", "Researches current information and web-grounded answers.")
+
     async def generate_report(self) -> str:
         prompt = (
             "כתוב דוח אינטליגנציה יומי בעברית, חד, מקצועי וקריא.\n"
@@ -36,15 +42,58 @@ class ResearchAgent:
         )
         return await generate_web(prompt)
 
+    async def run(self, task: dict, context: dict) -> dict:
+        shared = read_shared_context(task, context)
+        message = (shared.user_message or task.get("message") or "").strip()
+        if not message:
+            result = build_agent_result(
+                agent=self.name,
+                status="failed",
+                notes="missing research message",
+                should_fallback=True,
+                agent_context=shared.to_dict(),
+            )
+            shared.research_output = result
+            shared.add_log(self.name, "missing research message")
+            result["agent_context"] = shared.to_dict()
+            return result
+
+        prompt = (
+            "ענה בעברית בצורה קצרה, חדה ומבוססת מקורות עדכניים. "
+            "אם חסר מידע ודאי תגיד זאת.\n\n"
+            f"בקשת המשתמש: {message}"
+        )
+        try:
+            output = await generate_web(prompt, memory_context=shared.memory_context or (context or {}).get("memory_context"))
+            result = build_agent_result(
+                agent=self.name,
+                output=output,
+                notes="web research completed",
+                agent_context=shared.to_dict(),
+            )
+            shared.research_output = result
+            shared.add_log(self.name, "research success")
+            result["agent_context"] = shared.to_dict()
+            return result
+        except Exception as e:
+            result = build_agent_result(
+                agent=self.name,
+                status="failed",
+                notes=f"research error: {e}",
+                should_fallback=True,
+                agent_context=shared.to_dict(),
+            )
+            shared.research_output = result
+            shared.add_log(self.name, f"research failed: {e}")
+            result["agent_context"] = shared.to_dict()
+            return result
+
     async def run_proactive_report(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Scheduled intelligence feed - 2 times a day."""
         try:
             chat_id = context.job.data.get("chat_id")
             if not chat_id:
                 return
-
             response = await self.generate_report()
             await context.bot.send_message(chat_id=chat_id, text=response)
-
         except Exception as e:
             print(f"Proactive report job error: {e}")

@@ -20,6 +20,15 @@ from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
 from experts.gpt_orchestrator import GPTOrchestrator  # decide(message, memory_context) -> dict
 from experts.claude_client import sanity_check_answer, review_and_improve_code
 from utils.benjamin_identity import build_benjamin_user_prompt
+from utils.logger import log_orchestration
+
+try:
+    from orchestrator.hybrid_router import HybridRouter
+except Exception:  # pragma: no cover
+    HybridRouter = None
+
+from agents.agent_contract import normalize_agent_result
+from orchestrator.validation_layer import ValidationLayer
 
 # Agent loop (optional; exists in your project per your summary)
 try:
@@ -35,6 +44,12 @@ TASK_AGENT_MAP = {
     "planning": "planning",
     "execution": "execution",
     "verification": "verification",
+    "code": "code",
+    "finance": "finance",
+    "assistant": "assistant",
+    "fitness_health": "fitness_health",
+    "relationships": "relationships",
+    "business_strategy": "business_strategy",
 }
 
 
@@ -100,13 +115,18 @@ def _normalize_plan(plan: dict) -> dict:
 
 class BenjaminOrchestrator:
     def __init__(self):
-       self.router = GPTOrchestrator()
-       self.agent_registry = agent_registry
+        self.gpt_router = GPTOrchestrator()
+        self.router = HybridRouter(self.gpt_router) if HybridRouter is not None else self.gpt_router
+        self.agent_registry = agent_registry
+        self.validation_layer = ValidationLayer()
 
     async def plan(self, message: str, memory_context: dict | None = None) -> dict:
         plan = await self.router.decide(message, memory_context=memory_context)
         plan = _normalize_plan(plan)
+        plan.setdefault("task_type", self._resolve_task_type(message, plan, {"memory_context": memory_context or {}}))
+        plan.setdefault("routing_source", "hybrid" if HybridRouter is not None else "llm")
         print(f"Routing decision: {plan}")
+        log_orchestration("routing_decision", task_type=plan.get("task_type"), routing_source=plan.get("routing_source"), execution_mode=plan.get("execution_mode"), use_web=plan.get("use_web"))
         return plan
 
     async def governor(self, message: str, memory_context: dict | None = None) -> dict:
@@ -278,6 +298,9 @@ class BenjaminOrchestrator:
             use_verification = needs_verification
             reason = "general request with safe defaults"
 
+        resolved_task_type = self._resolve_task_type(message, plan, context)
+        routing_source = str(plan.get("routing_source") or "llm").strip().lower()
+
         sequence: list[str] = []
         if use_memory:
             sequence.append("memory")
@@ -290,6 +313,10 @@ class BenjaminOrchestrator:
         if use_verification:
             sequence.append("verification")
 
+        prioritized_agent = TASK_AGENT_MAP.get(resolved_task_type) if resolved_task_type else None
+        if prioritized_agent and prioritized_agent not in sequence:
+            sequence.insert(0, prioritized_agent)
+
         execution_plan = {
             "use_memory": use_memory,
             "use_planning": use_planning,
@@ -298,8 +325,11 @@ class BenjaminOrchestrator:
             "use_verification": use_verification,
             "agent_sequence": sequence,
             "reason": reason,
+            "task_type": resolved_task_type,
+            "routing_source": routing_source,
         }
         print(f"Agent routing plan: {execution_plan}")
+        log_orchestration("execution_plan", task_type=resolved_task_type, routing_source=routing_source, agents=sequence, reason=reason)
         return execution_plan
 
     async def run_agent_sequence(
@@ -323,11 +353,12 @@ class BenjaminOrchestrator:
             task=plan,
             user_message=message,
             memory_context=context.get("memory_context") if isinstance(context.get("memory_context"), dict) else {},
-            metadata={"routing_plan": execution_plan, "chosen_sequence": sequence},
+            metadata={"routing_plan": execution_plan, "chosen_sequence": sequence, "agent_capabilities": {}},
         )
 
         for agent_name in sequence:
             agent = self.agent_registry.get(agent_name)
+            shared.metadata.setdefault("agent_capabilities", {})[agent_name] = self.agent_registry.get_capabilities(agent_name) if hasattr(self.agent_registry, "get_capabilities") else {}
             if agent is None:
                 shared.add_log("orchestrator", f"{agent_name}: missing agent, skipped")
                 continue
@@ -353,17 +384,14 @@ class BenjaminOrchestrator:
             }
 
             try:
-                result = await run_fn(task_payload, agent_context)
+                raw_result = await run_fn(task_payload, agent_context)
+                result = normalize_agent_result(agent_name, raw_result, fallback_note=f"{agent_name}: invalid result")
                 actual_ran.append(agent_name)
             except NotImplementedError:
                 shared.add_log("orchestrator", f"{agent_name}: not implemented, skipped")
                 continue
             except Exception as e:
                 shared.add_log("orchestrator", f"{agent_name}: error ({e}), skipped")
-                continue
-
-            if not isinstance(result, dict):
-                shared.add_log("orchestrator", f"{agent_name}: invalid result type, skipped")
                 continue
 
             if isinstance(result.get("agent_context"), dict):
@@ -424,19 +452,45 @@ class BenjaminOrchestrator:
         """
         plan = _normalize_plan(plan)
         context = context or {}
+        context.setdefault("task_type", plan.get("task_type"))
+        context.setdefault("routing_source", plan.get("routing_source"))
         start = time.time()
 
+        if not plan.get("task_type"):
+            plan["task_type"] = self._resolve_task_type(message, plan, context)
+        plan.setdefault("routing_source", "llm")
+
         self._log_plan(plan)
+
+        specialized_result = await self._try_run_specialized_agent(message, plan, context)
+        if specialized_result is not None:
+            validation = self.validation_layer.validate(message=message, plan=plan, result=specialized_result)
+            log_orchestration("specialized_result", task_type=plan.get("task_type"), routing_source=plan.get("routing_source"), valid=validation["is_valid"], summary=validation["summary"])
+            if validation["is_valid"]:
+                elapsed = time.time() - start
+                print(f"Execution time: {elapsed:.2f}s")
+                return specialized_result
+
         execution_plan = self.build_execution_plan(message, plan, context)
         routed_result = await self.run_agent_sequence(message, plan, context, execution_plan)
         if routed_result is not None:
-            elapsed = time.time() - start
-            print(f"Execution time: {elapsed:.2f}s")
-            return routed_result
+            validation = self.validation_layer.validate(message=message, plan=plan, execution_plan=execution_plan, result=routed_result)
+            log_orchestration("agent_sequence_result", task_type=plan.get("task_type"), routing_source=plan.get("routing_source"), agents=execution_plan.get("agent_sequence"), valid=validation["is_valid"], summary=validation["summary"])
+            if validation["is_valid"]:
+                elapsed = time.time() - start
+                print(f"Execution time: {elapsed:.2f}s")
+                return routed_result
 
+        if plan.get("execution_mode") == "agent_loop":
+            result = await self._execute_agent_loop(message, plan, context, resume_state)
+        else:
+            result = await self._execute_direct(message, plan, context)
+
+        validation = self.validation_layer.validate(message=message, plan=plan, execution_plan=execution_plan, result=result)
+        log_orchestration("fallback_result", task_type=plan.get("task_type"), routing_source=plan.get("routing_source"), valid=validation["is_valid"], summary=validation["summary"])
         elapsed = time.time() - start
         print(f"Execution time: {elapsed:.2f}s")
-        return "מצטער, לא הצלחתי להשלים את הבקשה כרגע. נסה לנסח מחדש בקצרה."
+        return result if validation["is_valid"] else "מצטער, לא הצלחתי להשלים את הבקשה כרגע. נסה לנסח מחדש בקצרה."
 
     def _resolve_task_type(self, message: str, plan: dict, context: dict) -> str | None:
         explicit = (context.get("task_type") or plan.get("task_type") or "").strip().lower()
@@ -446,13 +500,33 @@ class BenjaminOrchestrator:
         tools_required = [str(t).lower() for t in (plan.get("tools_required") or [])]
         if any("memory" in t for t in tools_required) or plan.get("suggest_memory_write"):
             return "memory"
+        if any(t in tools_required for t in ["files", "code", "repo"]):
+            return "code"
+        if any(t in tools_required for t in ["calendar", "assistant"]):
+            return "assistant"
+        if any(t in tools_required for t in ["finance", "market_data"]):
+            return "finance"
+        if any(t in tools_required for t in ["fitness", "nutrition", "health"]):
+            return "fitness_health"
         if plan.get("require_task_decomposition"):
             return "planning"
+        if plan.get("require_code_review"):
+            return "code"
+        if plan.get("use_web") and any(k in (message or "").lower() for k in ["מניה", "מניות", "מדד", "שוק", "מאקרו", "finance", "stock", "stocks", "macro", "ta35", "spx", "qqq", "spy"]):
+            return "finance"
         if plan.get("execution_mode") == "agent_loop":
             return "execution"
 
         msg = (message or "").lower()
-        if any(k in msg for k in ["research", "חקור", "בדוק מקורות", "market scan", "news scan"]):
+        if any(k in msg for k in ["אימון", "כושר", "תזונה", "מסה", "חיטוב", "קלור", "חלבון", "ארוחה", "diet", "nutrition", "workout", "bulk", "cut"]):
+            return "fitness_health"
+        if any(k in msg for k in ["קוד", "python", "bug", "error", "exception", "stack trace", "refactor", "architecture"]):
+            return "code"
+        if any(k in msg for k in ["מניה", "מניות", "מדד", "שוק", "מאקרו", "finance", "stock", "stocks", "macro", "ta35", "spx", "qqq", "spy"]):
+            return "finance"
+        if any(k in msg for k in ["תזכיר", "יומן", "לו""ז", "משימה", "תארגן", "calendar", "schedule", "reminder", "assistant"]):
+            return "assistant"
+        if any(k in msg for k in ["research", "חקור", "בדוק מקורות", "market scan", "news scan", "חדשות", "news"]):
             return "research"
         if any(k in msg for k in ["memory", "תזכור", "זכור"]):
             return "memory"
@@ -462,6 +536,10 @@ class BenjaminOrchestrator:
             return "verification"
         if any(k in msg for k in ["execute", "הרץ", "בצע"]):
             return "execution"
+        if any(k in msg for k in ["relationship", "dating", "social", "זוגיות", "אקסית", "קשר", "בחורה", "דייט", "רגשות", "תקשורת"]):
+            return "relationships"
+        if any(k in msg for k in ["business", "strategy", "offer", "pricing", "gtm", "growth", "עסק", "אסטרטגיה", "הצעה", "מוצר", "לקוחות", "מכירות", "מוניטיזציה"]):
+            return "business_strategy"
 
         return None
 
@@ -490,15 +568,14 @@ class BenjaminOrchestrator:
         }
 
         try:
-            routed = await run_fn(task_payload, agent_context)
+            raw_routed = await run_fn(task_payload, agent_context)
+            routed = normalize_agent_result(agent_name, raw_routed, fallback_note="specialized agent invalid result")
         except NotImplementedError:
             return None
         except Exception as e:
             print(f"Specialized agent '{agent_name}' failed, fallback to default flow: {e}")
             return None
 
-        if not isinstance(routed, dict):
-            return None
         if routed.get("status") == "not_implemented" or routed.get("should_fallback"):
             return None
         if task_type == "execution":
@@ -569,6 +646,8 @@ class BenjaminOrchestrator:
         print(f"  require_code_review: {plan.get('require_code_review')}")
         print(f"  require_task_decomposition: {plan.get('require_task_decomposition')}")
         print(f"  governors: {plan.get('governors')}")
+        print(f"  task_type: {plan.get('task_type')}")
+        print(f"  routing_source: {plan.get('routing_source')}")
         if plan.get("suggest_memory_write"):
             mem = plan.get("memory_to_write")
             print(f"  suggest_memory_write: True | memory_to_write: {mem}")

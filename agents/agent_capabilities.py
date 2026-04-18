@@ -1,0 +1,104 @@
+"""Capability catalog for Benjamin agents."""
+
+from __future__ import annotations
+
+DEFAULT_AGENT_CAPABILITIES = {
+    "research": {
+        "description": "Research and current-news agent.",
+        "can_handle": ["news", "markets", "research", "fact_check", "current_events"],
+        "tools_required": ["web"],
+        "read_only": True,
+        "write_capable": False,
+    },
+    "memory": {
+        "description": "User memory agent.",
+        "can_handle": ["memory_read", "memory_write", "profile_recall"],
+        "tools_required": ["memory_db"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "planning": {
+        "description": "Task decomposition and structured planning.",
+        "can_handle": ["planning", "decomposition", "architecture"],
+        "tools_required": ["llm"],
+        "read_only": True,
+        "write_capable": False,
+    },
+    "execution": {
+        "description": "General execution agent.",
+        "can_handle": ["execution", "general_response", "drafting"],
+        "tools_required": ["llm", "web_optional"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "verification": {
+        "description": "Validation and revision agent.",
+        "can_handle": ["verification", "qa", "code_review"],
+        "tools_required": ["claude"],
+        "read_only": True,
+        "write_capable": False,
+    },
+    "code": {
+        "description": "Code and architecture agent.",
+        "can_handle": ["code", "debugging", "architecture", "refactor"],
+        "tools_required": ["llm", "files"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "finance": {
+        "description": "Markets and financial-analysis agent.",
+        "can_handle": ["markets", "stocks", "macro", "finance_analysis"],
+        "tools_required": ["web"],
+        "read_only": True,
+        "write_capable": False,
+    },
+    "assistant": {
+        "description": "Personal assistant for tasks and organization.",
+        "can_handle": ["personal_tasks", "scheduling", "organization", "reminders"],
+        "tools_required": ["memory", "calendar", "llm"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "fitness_health": {
+        "description": "Fitness, training, nutrition and body-optimization agent.",
+        "can_handle": ["fitness", "nutrition", "training_program", "meal_plan", "health_routine"],
+        "tools_required": ["all_tools"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "relationships": {
+        "description": "Relationship dynamics, social situations, dating, communication, emotional analysis, and interpersonal strategy.",
+        "can_handle": ["relationships", "dating", "social_dynamics", "communication", "emotional_analysis"],
+        "tools_required": ["llm", "memory_db"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "business_strategy": {
+        "description": "Business thinking, offers, positioning, GTM, monetization, growth strategy, and execution prioritization.",
+        "can_handle": ["business", "strategy", "pricing", "gtm", "growth", "monetization"],
+        "tools_required": ["llm", "web", "files"],
+        "read_only": False,
+        "write_capable": True,
+    },
+    "breaking": {
+        "description": "Proactive breaking-alert pipeline.",
+        "can_handle": ["alerts", "breaking_news"],
+        "tools_required": ["web", "memory_db"],
+        "read_only": True,
+        "write_capable": False,
+    },
+    "priority": {
+        "description": "Ranks proactive alerts.",
+        "can_handle": ["ranking", "priority_scoring"],
+        "tools_required": ["llm"],
+        "read_only": True,
+        "write_capable": False,
+    },
+    "quality": {
+        "description": "Polishes outbound text.",
+        "can_handle": ["polish", "rewrite"],
+        "tools_required": ["llm"],
+        "read_only": True,
+        "write_capable": False,
+    },
+}

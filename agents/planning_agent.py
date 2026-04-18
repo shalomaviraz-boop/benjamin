@@ -3,6 +3,7 @@
 import json
 
 from agents.agent_context import read_shared_context
+from agents.agent_contract import build_agent_result
 from agents.base_agent import BaseAgent
 from experts.gemini_client import generate_fast
 
@@ -36,13 +37,20 @@ class PlanningAgent(BaseAgent):
         shared = read_shared_context(task, context)
         message = (shared.user_message or task.get("message") or "").strip()
         if not message:
-            result = {
-                "objective": "",
-                "steps": [],
-                "needs_research": False,
-                "needs_verification": False,
-                "recommended_agent_sequence": ["execution"],
-            }
+            result = build_agent_result(
+                agent=self.name,
+                output="",
+                notes="empty message, returning fallback plan",
+                data={
+                    "objective": "",
+                    "steps": [],
+                    "needs_research": False,
+                    "needs_verification": False,
+                    "recommended_agent_sequence": ["execution"],
+                },
+                agent_context=shared.to_dict(),
+            )
+            result.update(result["data"])
             shared.planning_output = result
             shared.add_log(self.name, "empty message, returning fallback plan")
             result["agent_context"] = shared.to_dict()
@@ -82,16 +90,24 @@ class PlanningAgent(BaseAgent):
         if not sequence:
             sequence = ["execution"]
 
-        result = {
+        payload = {
             "objective": str(out.get("objective") or message)[:220],
             "steps": steps,
             "needs_research": bool(out.get("needs_research")),
             "needs_verification": bool(out.get("needs_verification")),
             "recommended_agent_sequence": sequence,
         }
+        result = build_agent_result(
+            agent=self.name,
+            output=payload["objective"],
+            notes=f"planned {len(steps)} steps",
+            data=payload,
+            agent_context=shared.to_dict(),
+        )
+        result.update(payload)
         shared.planning_output = result
-        shared.metadata["planning_needs_research"] = result["needs_research"]
-        shared.metadata["planning_needs_verification"] = result["needs_verification"]
+        shared.metadata["planning_needs_research"] = payload["needs_research"]
+        shared.metadata["planning_needs_verification"] = payload["needs_verification"]
         shared.add_log(self.name, f"planned {len(steps)} steps")
         result["agent_context"] = shared.to_dict()
         return result
