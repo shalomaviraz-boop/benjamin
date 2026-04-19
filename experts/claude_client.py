@@ -137,3 +137,41 @@ async def sanity_check_answer(
 
 async def generate_reasoning(prompt: str, *, system_prompt: str | None = None) -> str:
     return await asyncio.to_thread(_generate_reasoning_sync, prompt, system_prompt=system_prompt)
+
+
+class ClaudeClient:
+    """Backward-compatible async facade for legacy pipeline callers."""
+
+    async def review_advice(self, user_request: str, draft_answer: str) -> str:
+        return await sanity_check_answer(draft_answer, user_request, None)
+
+    async def write_code(self, user_request: str, fix_issues: list[str] | None = None) -> str:
+        issues_block = ""
+        if fix_issues:
+            issues_text = "\n".join(f"- {issue}" for issue in fix_issues if str(issue).strip())
+            if issues_text:
+                issues_block = f"\nKnown issues to fix:\n{issues_text}\n"
+
+        prompt = (
+            "Write production-ready code for the user's request.\n"
+            "Return ONLY the final code. No markdown fences. No explanation.\n"
+            "Prefer clear, correct code over clever code.\n"
+            f"\nUser request:\n{user_request}\n"
+            f"{issues_block}"
+        )
+        return await generate_reasoning(
+            prompt,
+            system_prompt="You are Benjamin's coding specialist. Return only code.",
+        )
+
+    async def review_code(self, code_text: str) -> str:
+        prompt = (
+            "Review the following code briefly.\n"
+            "Focus on correctness, risks, and clarity.\n"
+            "Return a short review in the same language as the surrounding request context when possible.\n\n"
+            f"{code_text}"
+        )
+        return await generate_reasoning(
+            prompt,
+            system_prompt="You are Benjamin's code reviewer. Be concise and specific.",
+        )

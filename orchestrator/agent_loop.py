@@ -117,7 +117,7 @@ async def _plan_next_steps(
         f"Start step_id from {next_step_id}."
     )
 
-    raw = await asyncio.to_thread(generate_fast, prompt)
+    raw = await generate_fast(prompt)
 
     try:
         text = raw.strip()
@@ -171,16 +171,16 @@ async def _execute_step(
     if intent == "research":
         prompt = _worker_prompt(instruction, memory_context)
         if use_web:
-            return await asyncio.to_thread(generate_web, prompt)
-        return await asyncio.to_thread(generate_fast, prompt)
+            return await generate_web(prompt)
+        return await generate_fast(prompt)
 
     if intent == "verify":
         draft = prior_results[-1] if prior_results else instruction
-        return await asyncio.to_thread(sanity_check_answer, draft, message, None)
+        return await sanity_check_answer(draft, message, None)
 
     if intent == "code_review":
         draft = prior_results[-1] if prior_results else instruction
-        return await asyncio.to_thread(review_and_improve_code, draft, message)
+        return await review_and_improve_code(draft, message)
 
     if intent == "bash":
         return await _run_safe_bash(instruction)
@@ -198,7 +198,7 @@ async def _execute_step(
             "as the user's request."
         )
         prompt = _worker_prompt(prompt, memory_context)
-        return await asyncio.to_thread(generate_fast, prompt)
+        return await generate_fast(prompt)
 
     if intent in ("write", "edit", "todo"):
         return f"[Task noted: {instruction}]"
@@ -391,8 +391,7 @@ async def run_agent_loop(
 
     # Governor limit reached — compile what we have
     if results:
-        compiled = await asyncio.to_thread(
-            generate_fast,
+        compiled = await generate_fast(
             f"User request: {message}\n\n"
             "Gathered info:\n"
             + "\n---\n".join(results)
