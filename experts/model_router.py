@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from experts.claude_client import generate_reasoning
 from experts.gemini_client import generate_fast, generate_web
+from memory.memory_store import format_memory_for_prompt
 
 OPENAI_REPLY_MODEL = os.getenv("BENJAMIN_GPT_REPLY_MODEL", "gpt-4o-mini")
 
@@ -39,49 +40,14 @@ async def _generate_gpt(prompt: str, *, system_prompt: str | None = None) -> str
 
 
 def _inject_memory_for_non_gemini(prompt: str, memory_context: dict | None) -> str:
-    if not isinstance(memory_context, dict) or not memory_context:
+    context_block = format_memory_for_prompt(
+        memory_context,
+        detailed=False,
+        include_conversation=True,
+    )
+    if not context_block:
         return prompt
-
-    sections: list[str] = []
-    user_brief = memory_context.get("user_brief")
-    if isinstance(user_brief, dict) and user_brief:
-        sections.append("User brief:")
-        for key, value in user_brief.items():
-            if value in (None, "", [], {}):
-                continue
-            sections.append(f"- {key}: {value}")
-
-    personal_model = memory_context.get("personal_model")
-    if isinstance(personal_model, dict) and personal_model:
-        sections.append("Personal model:")
-        for key, value in list(personal_model.items())[:8]:
-            if value in (None, "", [], {}):
-                continue
-            sections.append(f"- {key}: {value}")
-
-    relevant_memories = memory_context.get("relevant_memories") or []
-    if isinstance(relevant_memories, list) and relevant_memories:
-        sections.append("Relevant memories:")
-        for mem in relevant_memories[:6]:
-            if not isinstance(mem, dict):
-                continue
-            key = str(mem.get("key") or "").strip()
-            value = str(mem.get("value") or "").strip()
-            if key and value:
-                sections.append(f"- {key}: {value}")
-
-    project_state = memory_context.get("project_state")
-    if isinstance(project_state, dict) and project_state:
-        sections.append("Project state:")
-        for key, value in list(project_state.items())[:6]:
-            if value in (None, "", [], {}):
-                continue
-            sections.append(f"- {key}: {value}")
-
-    if not sections:
-        return prompt
-
-    return "Context for Benjamin:\n" + "\n".join(sections) + "\n\n" + prompt
+    return context_block + "\n\n" + prompt
 
 
 class ModelRouter:

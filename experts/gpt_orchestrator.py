@@ -49,25 +49,92 @@ def _clean_key(raw: str) -> str:
     return k
 
 
+VALID_MEMORY_TYPES = {
+    "identity",
+    "preference",
+    "project",
+    "behavioral",
+    "relational",
+    "temporal",
+    "strategic",
+    "fact",
+    "profile",
+    "goal",
+    "note",
+    "dislike",
+}
+
+
+def _normalize_memory_type(raw: Any) -> str:
+    value = str(raw or "").strip().lower() or "identity"
+    aliases = {
+        "fact": "identity",
+        "profile": "identity",
+        "goal": "strategic",
+        "note": "temporal",
+        "dislike": "preference",
+    }
+    return aliases.get(value, value if value in VALID_MEMORY_TYPES else "identity")
+
+
 def _validate_memory_obj(mem: Any) -> Optional[dict]:
     """Return sanitized memory object or None."""
     if not isinstance(mem, dict):
         return None
 
-    mtype = str(mem.get("type") or "").strip() or "fact"
+    mtype = _normalize_memory_type(mem.get("memory_type") or mem.get("type"))
     key = _clean_key(mem.get("key") or "")
     value = str(mem.get("value") or "").strip()
+    summary = str(mem.get("summary") or value).strip()
+    try:
+        confidence = int(mem.get("confidence", 85))
+    except Exception:
+        confidence = 85
+    try:
+        priority = int(mem.get("priority", 5))
+    except Exception:
+        priority = 5
+    overwrite = bool(mem.get("overwrite", True))
 
-    # hard rules
     if not key or not value:
         return None
     if len(key) > 40:
         key = key[:40].rstrip()
-    # prevent huge values
     if len(value) > 500:
         value = value[:500].rstrip() + "…"
+    if len(summary) > 200:
+        summary = summary[:200].rstrip() + "…"
+    confidence = max(0, min(confidence, 100))
+    priority = max(1, min(priority, 10))
 
-    return {"type": mtype, "key": key, "value": value}
+    return {
+        "memory_type": mtype,
+        "type": mtype,
+        "key": key,
+        "value": value,
+        "summary": summary,
+        "confidence": confidence,
+        "priority": priority,
+        "overwrite": overwrite,
+    }
+
+
+def _validate_learning_insight(item: Any) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    validated = _validate_memory_obj(item)
+    if not validated:
+        return None
+    return {
+        "memory_type": validated["memory_type"],
+        "key": validated["key"],
+        "value": validated["value"],
+        "summary": validated["summary"],
+        "confidence": validated["confidence"],
+        "priority": validated["priority"],
+        "overwrite": bool(item.get("overwrite") or item.get("override", False)),
+        "evidence": str(item.get("evidence") or "").strip()[:240],
+    }
 
 
 def _safe_json_loads(s: str) -> dict:
@@ -167,7 +234,15 @@ Memory (חשוב!):
 - אתה רשאי רק "להציע" שמירת זיכרון.
 - אם אין משהו איכותי/ברור לשמור → suggest_memory_write=false ו-memory_to_write=null
 - אם מציע זיכרון: memory_to_write חייב להיות:
-  { "type": "fact"|"preference"|"note"|"project", "key": קצר וברור (<=40 תווים), "value": טקסט קצר }
+  {
+    "memory_type": "identity"|"preference"|"project"|"behavioral"|"relational"|"temporal"|"strategic",
+    "key": קצר וברור (<=40 תווים),
+    "value": טקסט קצר,
+    "summary": סיכום קצר,
+    "confidence": 0-100,
+    "priority": 1-10,
+    "overwrite": true|false
+  }
 - אסור לייצר key ארוך/משפט. key חייב להיות "תגית" קצרה.
 
 החזר JSON בלבד בפורמט:
@@ -182,7 +257,7 @@ Memory (חשוב!):
   "governors": { "max_execution_time_seconds"?: int, "max_turns"?: int },
   "reason": "מילה-שתיים למה",
   "suggest_memory_write": bool,
-  "memory_to_write": { "type": "...", "key": "...", "value": "..." } | null
+  "memory_to_write": { "memory_type": "...", "key": "...", "value": "...", "summary": "...", "confidence": 0-100, "priority": 1-10, "overwrite": true|false } | null
 }
 """.strip()
 
@@ -208,35 +283,47 @@ Guidelines:
 - If the user is drifting / starting a new big project / over-architecting, set intervention_level=1 or 2.
 """.strip()
 
-PROFILE_EXTRACTOR_SYSTEM_PROMPT = """
-You are Benjamin's Profile Extractor.
-Your job: detect if the user's message contains durable personal information
-that should update the Personal Model.
+MEMORY_LEARNING_SYSTEM_PROMPT = """
+You are Benjamin's Memory Learning Engine.
+Your job: inspect a user's message plus known context and decide whether we learned anything durable or strategically useful about Matan.
 
 Return ONLY valid JSON with this schema:
 {
-  "field": "<string field name or empty>",
-  "value": "<string value>",
-  "confidence": 0-100,
-  "override": true|false
+  "learned_anything": true|false,
+  "insights": [
+    {
+      "memory_type": "identity"|"preference"|"project"|"behavioral"|"relational"|"temporal"|"strategic",
+      "key": "<short stable key <=40 chars>",
+      "value": "<compressed insight>",
+      "summary": "<one-line why it matters>",
+      "confidence": 0-100,
+      "priority": 1-10,
+      "overwrite": true|false,
+      "evidence": "<brief quote or rationale>"
+    }
+  ]
 }
 
 Rules:
-- Extract ONLY stable traits, goals, preferences, identity facts.
-- Prefer these fields when relevant: communication_style, preferences, dislikes, active_projects, recurring_goals, decision_patterns, name, location, role.
-- Ignore temporary states ("אני עייף היום", "בא לי פיצה").
-- If nothing durable → return field="" and confidence=0.
-- Confidence must reflect how sure you are this is long-term.
-- Be conservative.
+- Extract at most 4 insights.
+- Only store information that is durable, recurring, emotionally meaningful, or strategically relevant.
+- Ignore trivial temporary states unless they represent a meaningful recent change worth temporal memory.
+- Prefer compressed operator-grade wording over verbose restatement.
+- Avoid duplicates if the known context already contains the same insight.
+- Use relational memory for people / dating / emotional relationship context.
+- Use behavioral memory for patterns, loops, strengths, blind spots, recurring mistakes, and execution issues.
+- Use temporal memory for recent phase shifts, new blockers, current transitions, or meaningful updates likely to matter soon.
+- Use preference memory for style, likes, dislikes, communication expectations.
+- Be conservative. If nothing useful was learned, return learned_anything=false with an empty insights array.
 """.strip()
 
 
 def _build_user_prompt(message: str, memory_context: Optional[dict]) -> str:
     mc = memory_context or {}
-    # keep these short; they are hints, not a full dump
     user_profile = mc.get("user_profile")
     relevant_memories = mc.get("relevant_memories") or []
     project_state = mc.get("project_state")
+    retrieval_summary = mc.get("retrieval_summary") or {}
 
     def _clip(x: Any, n: int) -> str:
         s = "" if x is None else str(x)
@@ -258,6 +345,8 @@ def _build_user_prompt(message: str, memory_context: Optional[dict]) -> str:
     user_brief = mc.get("user_brief")
     if user_brief:
         lines.append("USER_BRIEF: " + _clip(user_brief, 500))
+    if retrieval_summary:
+        lines.append("RETRIEVAL_SUMMARY: " + _clip(retrieval_summary, 500))
 
     lines.append("USER_MESSAGE: " + message)
     return "\n".join(lines)
@@ -338,38 +427,62 @@ class GPTOrchestrator:
         return out
 
     async def extract_profile_update(self, message: str) -> dict:
-        """Detect durable profile updates from user message."""
+        """Backward-compatible wrapper around layered learning."""
+        learned = await self.extract_memory_insights(message)
+        insights = learned.get("insights") or []
+        if not insights:
+            return {"should_update": False}
+        first = insights[0]
+        return {
+            "should_update": True,
+            "field": str(first.get("key") or "")[:40],
+            "value": str(first.get("value") or "")[:300],
+            "override": bool(first.get("overwrite", False)),
+            "confidence": int(first.get("confidence", 0)),
+        }
+
+    async def extract_memory_insights(self, message: str, memory_context: Optional[dict] = None) -> dict:
+        known_context = {
+            "user_brief": (memory_context or {}).get("user_brief") or {},
+            "retrieval_summary": (memory_context or {}).get("retrieval_summary") or {},
+            "relevant_memories": [
+                {
+                    "type": item.get("type"),
+                    "key": item.get("key"),
+                    "value": item.get("value"),
+                }
+                for item in ((memory_context or {}).get("relevant_memories") or [])[:10]
+                if isinstance(item, dict)
+            ],
+        }
+        payload = json.dumps(
+            {
+                "message": message,
+                "known_context": known_context,
+            },
+            ensure_ascii=False,
+        )
         resp = await self.client.chat.completions.create(
             model=MODEL,
             temperature=0,
             messages=[
-                {"role": "system", "content": PROFILE_EXTRACTOR_SYSTEM_PROMPT},
-                {"role": "user", "content": message},
+                {"role": "system", "content": MEMORY_LEARNING_SYSTEM_PROMPT},
+                {"role": "user", "content": payload},
             ],
         )
 
         text = (resp.choices[0].message.content or "").strip()
         out = _safe_json_loads(text) or {}
-
-        field = str(out.get("field") or "").strip()
-        value = str(out.get("value") or "").strip()
-        try:
-            confidence = int(out.get("confidence", 0))
-        except Exception:
-            confidence = 0
-        override = bool(out.get("override", False))
-
-        if confidence < 75 or not field or not value:
-            return {"should_update": False}
-
-        # basic limits
-        field = field[:40]
-        value = value[:300]
-
+        insights_raw = out.get("insights") if isinstance(out.get("insights"), list) else []
+        insights: list[dict] = []
+        for item in insights_raw[:4]:
+            validated = _validate_learning_insight(item)
+            if not validated:
+                continue
+            if int(validated.get("confidence", 0)) < 70:
+                continue
+            insights.append(validated)
         return {
-            "should_update": True,
-            "field": field,
-            "value": value,
-            "override": override,
-            "confidence": confidence,
+            "learned_anything": bool(insights),
+            "insights": insights,
         }

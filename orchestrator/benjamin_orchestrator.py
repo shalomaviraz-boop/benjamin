@@ -186,15 +186,21 @@ class BenjaminOrchestrator:
         # Memory preview
         if plan.get("suggest_memory_write") and isinstance(plan.get("memory_to_write"), dict):
             mem = plan["memory_to_write"]
-            mtype = (mem.get("type") or "fact").strip()
+            mtype = (mem.get("memory_type") or mem.get("type") or "identity").strip()
             key = (mem.get("key") or "").strip()
             value = _shorten(str(mem.get("value") or ""), 120)
+            summary = _shorten(str(mem.get("summary") or ""), 120)
+            confidence = mem.get("confidence")
 
             lines.append("")
             lines.append("אני מציע לשמור את זה לזיכרון:")
             lines.append(f"type: {mtype}")
             lines.append(f"key: {key}")
             lines.append(f"value: {value}")
+            if summary:
+                lines.append(f"summary: {summary}")
+            if confidence is not None:
+                lines.append(f"confidence: {confidence}")
 
         lines.append("לאשר? (כן / לא / שנה רמה)")
         return "\n".join(lines)

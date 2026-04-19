@@ -16,6 +16,7 @@ from memory.memory_store import (
     update_personal_model_field,
     build_user_brief,
     load_memory_context_snapshot,
+    learn_from_interaction,
     seed_user_core_profile,
 )
 from orchestrator.benjamin_orchestrator import BenjaminOrchestrator
@@ -120,8 +121,14 @@ def _pick_memory_values(memories: list[dict], *, types: set[str] | None = None, 
     return picked
 
 
-def _build_user_brief(profile: dict | None, personal_model: dict, recent_memories: list[dict], project_state: dict | None) -> dict:
-    return build_user_brief(profile, personal_model, recent_memories, project_state)
+def _build_user_brief(
+    profile: dict | None,
+    personal_model: dict,
+    recent_memories: list[dict],
+    project_state: dict | None,
+    **kwargs,
+) -> dict:
+    return build_user_brief(profile, personal_model, recent_memories, project_state, **kwargs)
 
 
 def _load_memory_context(user_id: str, message: str) -> dict:
@@ -146,15 +153,43 @@ def _persist_memory(user_id: str, plan: dict) -> None:
     if not mem or not isinstance(mem, dict):
         return
 
-    mtype = (mem.get("type") or "fact").strip()
+    mtype = (mem.get("memory_type") or mem.get("type") or "identity").strip()
     key = (mem.get("key") or "").strip()
     value = (mem.get("value") or "").strip()
 
     if not key or not value:
         return
 
-    upsert_memory(user_id, mtype, key, value)
-    print(f"Memory saved: ({mtype}) {key}={value[:50]}...")
+    learned = learn_from_interaction(
+        user_id,
+        f"plan_memory:{key}",
+        [
+            {
+                "memory_type": mtype,
+                "key": key,
+                "value": value,
+                "summary": mem.get("summary") or value,
+                "confidence": mem.get("confidence", 85),
+                "priority": mem.get("priority", 5),
+                "overwrite": mem.get("overwrite", True),
+            }
+        ],
+        source="plan_memory_write",
+    )
+    if learned:
+        print(f"Memory saved: ({mtype}) {key}={value[:50]}...")
+
+
+def _should_run_learning(message: str) -> bool:
+    text = (message or "").strip()
+    if len(text) < 12:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(REMEMBER_PREFIXES) or lowered.startswith(FORGET_PREFIXES):
+        return False
+    if lowered in RECALL_PHRASES or lowered in SHOW_MODEL_PHRASES:
+        return False
+    return True
 
 
 def _parse_remember_payload(message: str) -> dict | None:
@@ -305,27 +340,23 @@ class BenjaminMessageHandler:
         # Normal flow: load memory
         memory_context = _load_memory_context(user_id, message)
 
-        # --- Auto Learning: Profile Extractor ---
+        # --- Auto Learning: multi-layer memory extraction ---
         try:
-            profile_update = await self.orchestrator.router.extract_profile_update(message)
-            if profile_update.get("should_update"):
-                field = profile_update.get("field")
-                value = profile_update.get("value")
-                override = profile_update.get("override", False)
-
-                existing_model = memory_context.get("personal_model") or {}
-
-                if override or field not in existing_model:
-                    update_personal_model_field(user_id, field, value)
-                    # refresh local copy
-                    memory_context["personal_model"] = get_personal_model(user_id) or {}
-                    memory_context["user_brief"] = _build_user_brief(
-                        memory_context.get("user_profile"),
-                        memory_context["personal_model"],
-                        memory_context.get("recent_memories") or [],
-                        memory_context.get("project_state"),
-                    )
-                    print(f"Auto-learned field: {field}={value}")
+            if _should_run_learning(message):
+                extracted = await self.orchestrator.router.extract_memory_insights(
+                    message,
+                    memory_context=memory_context,
+                )
+                insights = extracted.get("insights") if isinstance(extracted, dict) else []
+                learned = learn_from_interaction(
+                    user_id,
+                    message,
+                    insights if isinstance(insights, list) else [],
+                    source="message_learning",
+                )
+                if learned:
+                    memory_context = _load_memory_context(user_id, message)
+                    print(f"Auto-learned {len(learned)} memory insight(s)")
         except Exception as e:
             print(f"Profile extractor error: {e}")
 
@@ -352,11 +383,19 @@ class BenjaminMessageHandler:
         )
 
     def _format_recall_response(self, user_id: str) -> str:
-        memories = list_memories(user_id, limit=15)
-        profile = get_profile(user_id)
-        state = get_project_state(user_id)
-        personal_model = get_personal_model(user_id) or {}
-        user_brief = _build_user_brief(profile, personal_model, memories, state)
+        memory_context = _load_memory_context(user_id, "what do you remember about me")
+        memories = memory_context.get("relevant_memories") or []
+        profile = memory_context.get("user_profile")
+        state = memory_context.get("project_state")
+        personal_model = memory_context.get("personal_model") or {}
+        memory_layers = memory_context.get("memory_layers") or {}
+        user_brief = _build_user_brief(
+            profile,
+            personal_model,
+            memory_context.get("recent_memories") or [],
+            state,
+            memory_layers=memory_layers,
+        )
 
         lines: list[str] = []
         if user_brief:
@@ -364,11 +403,14 @@ class BenjaminMessageHandler:
         if profile:
             lines.append("פרופיל: " + str(profile)[:200])
 
-        for m in memories:
-            mtype = m.get("type", "")
-            key = m.get("key", "")
-            val = str(m.get("value", ""))[:80]
-            lines.append(f"• ({mtype}) {key}: {val}")
+        for layer_name, items in memory_layers.items():
+            if not items:
+                continue
+            lines.append(f"{layer_name}:")
+            for m in items[:3]:
+                key = m.get("key", "")
+                val = str(m.get("value", ""))[:90]
+                lines.append(f"• {key}: {val}")
 
         if state:
             lines.append("פרויקט: " + str(state)[:150])
@@ -455,6 +497,7 @@ class BenjaminMessageHandler:
         exec_context: dict = {
             "cancelled": False,
             "memory_context": memory_context,
+            "user_id": user_id,
         }
         self.active_contexts[user_id] = exec_context
         try:
