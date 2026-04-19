@@ -14,6 +14,10 @@ from memory.memory_store import load_memory_context_snapshot
 
 from agents.memory_agent import MemoryAgent
 from agents.priority_agent import PriorityAgent
+from agents.proactive_filters import (
+    commit_send,
+    gate_proactive_candidate,
+)
 from agents.quality_agent import QualityAgent
 
 _STATE_DB_PATH = Path(__file__).resolve().parent.parent / "proactive_state.db"
@@ -368,6 +372,22 @@ class BreakingAgent:
                 return
 
             candidate = self.build_personal_candidate(verified, scored)
+            candidate.setdefault("severity", (verified.get("severity") or "").strip().lower())
+            candidate.setdefault("event_cluster", (verified.get("event_cluster") or "").strip())
+            candidate.setdefault("should_send", True)
+            candidate.setdefault("confidence", verified.get("confidence"))
+
+            gate = gate_proactive_candidate(
+                user_id=str(chat_id),
+                candidate=candidate,
+                memory_context=memory_context,
+                min_relevance=40,
+            )
+            if not gate.get("allowed"):
+                print(f"Breaking gate blocked: {gate.get('reason')}")
+                memory.update_event(topic_key, category, sent=False, verified=verified)
+                return
+
             text = await quality.render_proactive_message(
                 candidate=candidate,
                 memory_context=memory_context,
@@ -378,9 +398,11 @@ class BreakingAgent:
             await context.bot.send_message(chat_id=chat_id, text=text)
             _mark_cluster(cluster_key, category)
             _mark_alert_sent(dedupe_key, category)
+            commit_send(str(chat_id), candidate=candidate, gate_result=gate)
             memory.update_event(topic_key, category, sent=True, verified=verified)
             print(
-                f"Breaking alert sent: {category} | {verified.get('headline')} | cluster={cluster_key}"
+                f"Breaking alert sent: {category} | {verified.get('headline')} | "
+                f"cluster={cluster_key} | relevance={gate.get('relevance')}"
             )
 
         except Exception as e:

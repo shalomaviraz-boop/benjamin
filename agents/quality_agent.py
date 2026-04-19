@@ -5,6 +5,7 @@ Disabled by default so Benjamin does not auto-rewrite responses into chatbot voi
 
 from experts.model_router import model_router
 from utils.benjamin_identity import build_benjamin_internal_prompt
+from utils.output_sanitizer import sanitize_user_facing_text
 
 
 class QualityAgent:
@@ -47,7 +48,7 @@ class QualityAgent:
                 memory_context=memory_context,
                 use_web=False,
             )
-            return (output or "").strip()
+            return sanitize_user_facing_text((output or "").strip())
         except Exception:
             fallback_parts = [part for part in [headline, why_relevant or summary, opportunity] if part]
-            return " ".join(fallback_parts).strip()
+            return sanitize_user_facing_text(" ".join(fallback_parts).strip())

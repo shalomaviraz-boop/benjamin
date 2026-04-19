@@ -29,6 +29,7 @@ except Exception:  # pragma: no cover
 
 from agents.agent_contract import normalize_agent_result
 from orchestrator.validation_layer import ValidationLayer
+from utils.output_sanitizer import sanitize_user_facing_text
 
 # Agent loop (optional; exists in your project per your summary)
 try:
@@ -476,6 +477,8 @@ class BenjaminOrchestrator:
             if validation["is_valid"]:
                 elapsed = time.time() - start
                 print(f"Execution time: {elapsed:.2f}s")
+                if isinstance(specialized_result, str):
+                    return sanitize_user_facing_text(specialized_result)
                 return specialized_result
 
         execution_plan = self.build_execution_plan(message, plan, context)
@@ -486,6 +489,8 @@ class BenjaminOrchestrator:
             if validation["is_valid"]:
                 elapsed = time.time() - start
                 print(f"Execution time: {elapsed:.2f}s")
+                if isinstance(routed_result, str):
+                    return sanitize_user_facing_text(routed_result)
                 return routed_result
 
         if plan.get("execution_mode") == "agent_loop":
@@ -497,7 +502,11 @@ class BenjaminOrchestrator:
         log_orchestration("fallback_result", task_type=plan.get("task_type"), routing_source=plan.get("routing_source"), valid=validation["is_valid"], summary=validation["summary"])
         elapsed = time.time() - start
         print(f"Execution time: {elapsed:.2f}s")
-        return result if validation["is_valid"] else "מצטער, לא הצלחתי להשלים את הבקשה כרגע. נסה לנסח מחדש בקצרה."
+        if not validation["is_valid"]:
+            return "לא הצלחתי לסגור את זה עכשיו — נסה לנסח שוב בקצרה."
+        if isinstance(result, str):
+            return sanitize_user_facing_text(result)
+        return result
 
     def _resolve_task_type(self, message: str, plan: dict, context: dict) -> str | None:
         explicit = (context.get("task_type") or plan.get("task_type") or "").strip().lower()

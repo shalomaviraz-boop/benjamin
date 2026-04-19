@@ -7,6 +7,10 @@ from telegram.ext import ContextTypes
 from agents.agent_context import read_shared_context
 from agents.agent_contract import build_agent_result
 from agents.base_agent import BaseAgent
+from agents.proactive_filters import (
+    commit_send,
+    gate_proactive_candidate,
+)
 from experts.model_router import model_router
 from memory.memory_store import load_memory_context_snapshot
 
@@ -175,6 +179,16 @@ class ResearchAgent(BaseAgent):
             if not candidate or not bool(candidate.get("should_send")):
                 return
 
+            gate = gate_proactive_candidate(
+                user_id=str(chat_id),
+                candidate=candidate,
+                memory_context=memory_context,
+                min_relevance=50,
+            )
+            if not gate.get("allowed"):
+                print(f"Proactive report gate blocked: {gate.get('reason')}")
+                return
+
             if quality is not None:
                 response = await quality.render_proactive_message(
                     candidate=candidate,
@@ -186,5 +200,6 @@ class ResearchAgent(BaseAgent):
             if not response.strip():
                 return
             await context.bot.send_message(chat_id=chat_id, text=response)
+            commit_send(str(chat_id), candidate=candidate, gate_result=gate)
         except Exception as e:
             print(f"Proactive report job error: {e}")

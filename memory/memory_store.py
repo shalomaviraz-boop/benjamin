@@ -2160,6 +2160,60 @@ def build_user_brief(
     return brief
 
 
+FOLLOWUP_PRONOUNS = (
+    "זה",
+    "זאת",
+    "אותו",
+    "אותה",
+    "this",
+    "that",
+    "it",
+    "מה לגבי",
+    "מה עם",
+    "איך זה",
+    "ואיך זה",
+    "ומה עם",
+    "ומה לגבי",
+    "what about",
+    "how does this",
+    "how does that",
+)
+
+
+def _looks_like_followup(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text or len(text) > 200:
+        return False
+    return any(text.startswith(p) or f" {p} " in f" {text} " for p in FOLLOWUP_PRONOUNS)
+
+
+def _extract_recent_topic_anchor(conversation_tail: list[dict] | None) -> dict:
+    """Pull the latest assistant turn (or last user turn) as the recent-topic anchor."""
+    if not conversation_tail:
+        return {}
+    last_assistant = ""
+    last_user = ""
+    for item in reversed(conversation_tail):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = _normalize_text(item.get("content"), limit=320)
+        if not content:
+            continue
+        if role == "assistant" and not last_assistant:
+            last_assistant = content
+        elif role == "user" and not last_user:
+            last_user = content
+        if last_assistant and last_user:
+            break
+    anchor = {}
+    if last_assistant:
+        anchor["last_assistant"] = last_assistant
+    if last_user:
+        anchor["last_user"] = last_user
+    return anchor
+
+
 def load_memory_context_snapshot(
     user_id: str,
     query: str = "",
@@ -2197,7 +2251,22 @@ def load_memory_context_snapshot(
         memory_layers=memory_layers,
     )
     retrieval_summary = _build_retrieval_summary(query, memory_layers)
-    response_guidance = _build_response_guidance(query, memory_layers)
+    response_guidance = list(_build_response_guidance(query, memory_layers))
+    is_followup = _looks_like_followup(query)
+    recent_topic = _extract_recent_topic_anchor(conversation_tail)
+    if is_followup and recent_topic:
+        response_guidance.insert(
+            0,
+            "Follow-up resolution: the user used a pronoun (זה/this/מה עם...). Resolve the referent strictly from the most recent assistant/user turn below. Do NOT bring back older topics.",
+        )
+        if recent_topic.get("last_assistant"):
+            response_guidance.append(
+                f"Recent topic anchor (last assistant turn): {recent_topic['last_assistant'][:240]}"
+            )
+        if recent_topic.get("last_user"):
+            response_guidance.append(
+                f"Recent topic anchor (last user turn): {recent_topic['last_user'][:240]}"
+            )
     return {
         "user_profile": profile,
         "user_brief": user_brief,
@@ -2209,6 +2278,8 @@ def load_memory_context_snapshot(
         "memory_layers": memory_layers,
         "retrieval_summary": retrieval_summary,
         "response_guidance": response_guidance,
+        "is_followup": is_followup,
+        "recent_topic_anchor": recent_topic,
         "full_core_profile": EXPANDED_CORE_PROFILE_TEXT,
     }
 
