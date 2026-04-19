@@ -15,6 +15,7 @@ from memory.memory_store import (
     upsert_personal_model,
     update_personal_model_field,
     build_user_brief,
+    extract_rule_based_memory_insights,
     load_memory_context_snapshot,
     learn_from_interaction,
     seed_user_core_profile,
@@ -38,6 +39,7 @@ RECALL_PHRASES = {
 
 SHOW_MODEL_PHRASES = {"הצג מודל אישי", "show personal model"}
 UPDATE_MODEL_PREFIXES = ("עדכן מודל אישי", "update personal model")
+IMPLICIT_MEMORY_PREFIXES = ("חשוב שתדע ש", "חשוב שתדעי ש", "המטרה שלי היא", "my goal is")
 
 # --- Conversation SQLite setup ---
 _DB_PATH = Path(__file__).resolve().parent.parent / "conversation.db"
@@ -192,6 +194,139 @@ def _should_run_learning(message: str) -> bool:
     return True
 
 
+def _looks_like_contextual_remember(message: str) -> bool:
+    normalized = (message or "").strip().lower()
+    return bool(re.fullmatch(r"(תזכור|תזכרי|remember)(:)?\s*(את זה|זה|this)?", normalized))
+
+
+def _get_last_meaningful_context(user_id: str) -> str:
+    for item in reversed(_get_tail(user_id, limit=8)):
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if content and not _looks_like_contextual_remember(content):
+            return content
+    return ""
+
+
+_GOAL_TOPIC_SPECS: list[dict] = [
+    {
+        "name": "fitness",
+        "trigger_terms": ("כושר", "fitness", "מסה", "bulk", "muscle", "משקל", "אימון", "training"),
+        "search_query": "fitness goal mass current target weight muscle bulk כושר מסה משקל",
+        "primary_key": "fitness_goal",
+        "label_he": "מטרת הכושר שלך",
+        "render": "fitness",
+    },
+    {
+        "name": "business_revenue",
+        "trigger_terms": ("עסק", "business", "mrr", "arr", "revenue", "הכנסה עסקית", "saas"),
+        "must_terms": ("עסק", "business", "mrr", "arr", "saas", "revenue"),
+        "search_query": "business revenue mrr arr עסק הכנסה",
+        "primary_key": "business_revenue_goal",
+        "label_he": "יעד ההכנסה העסקית שלך",
+    },
+    {
+        "name": "business_customers",
+        "trigger_terms": ("לקוחות", "customers", "users", "משתמשים"),
+        "search_query": "business customers users לקוחות משתמשים",
+        "primary_key": "business_customer_target",
+        "label_he": "יעד הלקוחות שלך",
+    },
+    {
+        "name": "finance_savings",
+        "trigger_terms": ("חיסכון", "savings", "לחסוך", "save"),
+        "search_query": "finance savings goal חיסכון לחסוך",
+        "primary_key": "finance_savings_goal",
+        "label_he": "יעד החיסכון שלך",
+    },
+    {
+        "name": "finance_income",
+        "trigger_terms": ("הכנסה", "income", "salary", "משכורת", "להרוויח", "earn"),
+        "search_query": "finance income salary goal הכנסה משכורת להרוויח",
+        "primary_key": "finance_income_goal",
+        "label_he": "יעד ההכנסה שלך",
+    },
+    {
+        "name": "finance_investment",
+        "trigger_terms": ("השקעה", "invest", "portfolio", "תיק"),
+        "search_query": "finance investment portfolio השקעה תיק",
+        "primary_key": "finance_investment_goal",
+        "label_he": "יעד ההשקעה שלך",
+    },
+    {
+        "name": "career",
+        "trigger_terms": ("קריירה", "career", "תפקיד", "role", "job", "עבודה"),
+        "search_query": "career role target job קריירה תפקיד עבודה",
+        "primary_key": "career_target_role",
+        "label_he": "יעד הקריירה שלך",
+    },
+    {
+        "name": "learning",
+        "trigger_terms": ("ללמוד", "learn", "course", "קורס", "study", "לימוד"),
+        "search_query": "learning study course skill ללמוד קורס לימוד",
+        "primary_key": "learning_focus",
+        "label_he": "פוקוס הלימוד שלך",
+    },
+    {
+        "name": "sleep",
+        "trigger_terms": ("שינה", "sleep", "לישון"),
+        "search_query": "sleep hours שינה שעות",
+        "primary_key": "sleep_hours_goal",
+        "label_he": "יעד השינה שלך",
+    },
+    {
+        "name": "habit",
+        "trigger_terms": ("הרגל", "habit", "routine", "שגרה"),
+        "search_query": "habit routine daily הרגל שגרה",
+        "primary_key": "active_habit",
+        "label_he": "ההרגל הפעיל שלך",
+    },
+    {
+        "name": "primary_goal",
+        "trigger_terms": ("המטרה הראשית", "main goal", "primary goal", "המטרה שלי"),
+        "search_query": "primary goal stated_primary_goal",
+        "primary_key": "stated_primary_goal",
+        "label_he": "המטרה שהצהרת עליה",
+    },
+]
+
+
+def _format_goal_answer(spec: dict, primary: str, values: dict) -> str:
+    if spec.get("render") == "fitness":
+        current = values.get("current_weight_kg")
+        target = values.get("target_weight_kg")
+        if current and target:
+            return f"מטרת הכושר שלך כרגע היא לעלות מ-{current} ל-{target} ק\"ג."
+        return primary
+    label = spec["label_he"]
+    cleaned = re.sub(r"^(יעד|מטרת|פוקוס|הרגל)\s+\S+(?:\s+\S+)?\s*:\s*", "", primary).strip()
+    if not cleaned:
+        cleaned = primary
+    return f"{label}: {cleaned}"
+
+
+def _try_answer_goal_query(user_id: str, message: str) -> str | None:
+    lowered = (message or "").lower()
+    goal_terms = ("מטרה", "יעד", "goal", "target", "what's my", "מה ה", "מה ה-")
+    if not any(term in lowered for term in goal_terms):
+        return None
+
+    for spec in _GOAL_TOPIC_SPECS:
+        if not any(term in lowered for term in spec["trigger_terms"]):
+            continue
+        must = spec.get("must_terms")
+        if must and not any(term in lowered for term in must):
+            continue
+        matches = search_memories(user_id, spec["search_query"], limit=12)
+        values = {str(item.get("key") or ""): str(item.get("value") or "") for item in matches}
+        primary = values.get(spec["primary_key"])
+        if not primary:
+            continue
+        return _format_goal_answer(spec, primary, values)
+    return None
+
+
 def _parse_remember_payload(message: str) -> dict | None:
     """
     Supports:
@@ -246,6 +381,16 @@ def _parse_remember_payload(message: str) -> dict | None:
         v = v.strip()
         if k and v:
             return {"type": "fact", "key": k, "value": v}
+
+    # direct goal phrasing
+    if rest.startswith("שאני"):
+        value = rest[4:].strip()
+        if value:
+            return {"type": "identity", "key": "important_user_fact", "value": value}
+    if rest.startswith("I am"):
+        value = rest[4:].strip()
+        if value:
+            return {"type": "identity", "key": "important_user_fact", "value": value}
 
     # fallback note
     return {"type": "note", "key": "note", "value": rest}
@@ -306,6 +451,10 @@ class BenjaminMessageHandler:
         if normalized in RECALL_PHRASES:
             return self._format_recall_response(user_id)
 
+        direct_goal_answer = _try_answer_goal_query(user_id, trimmed)
+        if direct_goal_answer:
+            return direct_goal_answer
+
         # Show personal model
         if normalized in SHOW_MODEL_PHRASES:
             personal_model = get_personal_model(user_id) or {}
@@ -348,10 +497,14 @@ class BenjaminMessageHandler:
                     memory_context=memory_context,
                 )
                 insights = extracted.get("insights") if isinstance(extracted, dict) else []
+                deterministic = extract_rule_based_memory_insights(
+                    message,
+                    conversation_tail=memory_context.get("conversation_tail") or [],
+                )
                 learned = learn_from_interaction(
                     user_id,
                     message,
-                    insights if isinstance(insights, list) else [],
+                    deterministic + (insights if isinstance(insights, list) else []),
                     source="message_learning",
                 )
                 if learned:
@@ -421,16 +574,60 @@ class BenjaminMessageHandler:
         return "מה שאני זוכר:\n" + "\n".join(lines)
 
     async def _handle_explicit_remember(self, user_id: str, message: str) -> str:
+        contextual_text = _get_last_meaningful_context(user_id) if _looks_like_contextual_remember(message) else ""
         payload = _parse_remember_payload(message)
+        deterministic = extract_rule_based_memory_insights(
+            contextual_text or message,
+            conversation_tail=_get_tail(user_id, limit=8),
+        )
         if not payload:
-            return "מה לשמור? כתוב: תזכור: key=value"
+            if deterministic:
+                learn_from_interaction(
+                    user_id,
+                    contextual_text or message,
+                    deterministic,
+                    source="explicit_remember",
+                )
+                return "שמרתי."
+            return "שמרתי."
 
         mtype = payload["type"]
         key = payload["key"]
         value = payload["value"]
+        manual_insights = list(deterministic)
+        trivial_values = {"את זה", "זה", "this", "note"}
+        if value.strip().lower() not in {item.lower() for item in trivial_values}:
+            manual_insights.append(
+                {
+                    "memory_type": mtype,
+                    "key": key,
+                    "value": value,
+                    "summary": value,
+                    "confidence": 90,
+                    "priority": 6,
+                    "overwrite": True,
+                }
+            )
+        elif not manual_insights:
+            manual_insights.append(
+                {
+                    "memory_type": "temporal",
+                    "key": "remember_request",
+                    "value": contextual_text or "User asked Benjamin to remember recent context.",
+                    "summary": "User explicitly asked Benjamin to remember something.",
+                    "confidence": 72,
+                    "priority": 4,
+                    "overwrite": True,
+                }
+            )
 
-        upsert_memory(user_id, mtype, key, value)
-        return f"שמרתי.\n(type={mtype}, key={key}, value={value[:120]})"
+        learn_from_interaction(
+            user_id,
+            contextual_text or message,
+            manual_insights,
+            source="explicit_remember",
+        )
+        return "שמרתי."
 
     async def _handle_approval(self, normalized: str, user_id: str) -> str:
         pending = self.pending_plans[user_id]

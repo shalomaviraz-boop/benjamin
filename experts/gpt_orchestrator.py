@@ -314,6 +314,24 @@ Rules:
 - Use behavioral memory for patterns, loops, strengths, blind spots, recurring mistakes, and execution issues.
 - Use temporal memory for recent phase shifts, new blockers, current transitions, or meaningful updates likely to matter soon.
 - Use preference memory for style, likes, dislikes, communication expectations.
+- If the message contains a structured goal of any kind, preserve the concrete numbers, currency, role, name or status. Use stable keys per topic:
+  * Fitness:  fitness_goal, current_weight_kg, target_weight_kg, goal_type (muscle_gain|fat_loss|recomp), fitness_status.
+  * Finance:  finance_savings_goal, finance_income_goal, finance_investment_goal, finance_currency, finance_status.
+  * Career:   career_target_role, career_recent_change, career_transition.
+  * Business: business_revenue_goal, business_customer_target, business_launch_intent, business_status.
+  * Learning: learning_focus, learning_status.
+  * Habits:   active_habit, sleep_hours_goal.
+  * Relationship: active_dating_status, ex_dynamic_active, recent_relationship_event.
+  * Lifestyle: planned_relocation, planned_trip.
+  * Health:   nutrition_focus, health_medical_event.
+  Examples:
+    "I'm starting training for mass gain. From 71kg to 76kg" -> fitness_goal, current_weight_kg=71, target_weight_kg=76, goal_type=muscle_gain.
+    "אני רוצה להגיע למשכורת של 30k בחודש" -> finance_income_goal=30,000 ₪/month.
+    "המטרה שלי לחסוך 200k שנה הקרובה" -> finance_savings_goal=200,000 ₪.
+    "אני רוצה להיות Head of AI" -> career_target_role="Head of AI".
+    "אני רוצה להגיע ל-10k MRR" -> business_revenue_goal=10,000 USD MRR.
+    "אני מתחיל ללמוד ספרדית" -> learning_focus="Spanish".
+    "אני מתחיל לישון 8 שעות בלילה" -> sleep_hours_goal=8.
 - Be conservative. If nothing useful was learned, return learned_anything=false with an empty insights array.
 """.strip()
 

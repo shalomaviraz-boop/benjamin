@@ -4,9 +4,11 @@ import os
 import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 DB_PATH = os.getenv("BENJAMIN_MEMORY_DB", "benjamin_memory.db")
+MEMORY_FALLBACK_PATH = Path(DB_PATH).with_suffix(".fallback.jsonl")
 
 MEMORY_TYPES = (
     "identity",
@@ -594,6 +596,611 @@ def _normalize_key(value: Any) -> str:
     return key or "general"
 
 
+def _append_memory_fallback(payload: dict) -> None:
+    try:
+        MEMORY_FALLBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MEMORY_FALLBACK_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _normalize_stored_memory_payload(insight: dict) -> dict:
+    memory_type = _normalize_memory_type(insight.get("memory_type") or insight.get("type"))
+    key = _normalize_key(insight.get("key"))
+    value = str(insight.get("value") or "").strip()
+    summary = _normalize_text(insight.get("summary") or value, limit=400)
+    confidence = max(0, min(int(insight.get("confidence", 75)), 100))
+    priority = max(1, min(int(insight.get("priority", 4)), 10))
+    overwrite = bool(insight.get("overwrite") or insight.get("override"))
+    evidence = _normalize_text(insight.get("evidence") or "", limit=500)
+    return {
+        "memory_type": memory_type,
+        "key": key,
+        "value": value,
+        "summary": summary,
+        "confidence": confidence,
+        "priority": priority,
+        "overwrite": overwrite,
+        "evidence": evidence,
+    }
+
+
+def _is_meaningful_goal_text(text: str) -> bool:
+    clean = _normalize_text(text, limit=220)
+    return len(clean) >= 8 and clean.casefold() not in {"זה", "את זה", "this", "remember this"}
+
+
+def _extract_weight_targets(text: str) -> tuple[int, int] | None:
+    normalized = text.replace(",", ".")
+    patterns = [
+        r"מ\s*(\d{2,3})\s*(?:ק(?:\"|״)?ג|kg)?\s*ל\s*(\d{2,3})\s*(?:ק(?:\"|״)?ג|kg)?",
+        r"from\s*(\d{2,3})\s*(?:kg)?\s*to\s*(\d{2,3})\s*(?:kg)?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            try:
+                start = int(match.group(1))
+                target = int(match.group(2))
+                return start, target
+            except Exception:
+                return None
+    return None
+
+
+def _normalize_money_amount(raw: str, currency_hint: str | None = None) -> tuple[int, str] | None:
+    if raw is None:
+        return None
+    cleaned = raw.replace(",", "").replace(" ", "").strip()
+    if not cleaned:
+        return None
+    multiplier = 1
+    lowered = cleaned.lower()
+    if lowered.endswith("k"):
+        multiplier = 1_000
+        cleaned = cleaned[:-1]
+    elif lowered.endswith("m"):
+        multiplier = 1_000_000
+        cleaned = cleaned[:-1]
+    elif cleaned.endswith("אלף"):
+        multiplier = 1_000
+        cleaned = cleaned[:-3]
+    elif cleaned.endswith("מיליון"):
+        multiplier = 1_000_000
+        cleaned = cleaned[:-6]
+    cleaned = re.sub(r"[^\d\.]", "", cleaned)
+    if not cleaned:
+        return None
+    try:
+        amount = int(float(cleaned) * multiplier)
+    except Exception:
+        return None
+    currency = currency_hint or ""
+    if not currency:
+        if "$" in raw or "usd" in raw.lower() or "dollar" in raw.lower():
+            currency = "USD"
+        elif "₪" in raw or "שקל" in raw or "ש\"ח" in raw or "ils" in raw.lower():
+            currency = "ILS"
+        elif "€" in raw or "eur" in raw.lower():
+            currency = "EUR"
+        else:
+            currency = "ILS"
+    return amount, currency
+
+
+def _format_money(amount: int, currency: str) -> str:
+    symbol = {"ILS": "₪", "USD": "$", "EUR": "€"}.get(currency.upper(), currency)
+    if amount >= 1_000_000:
+        whole = amount / 1_000_000
+        rendered = f"{whole:.1f}".rstrip("0").rstrip(".")
+        return f"{rendered}M {symbol}"
+    if amount >= 1_000:
+        return f"{amount:,} {symbol}"
+    return f"{amount} {symbol}"
+
+
+def _find_money_amount(text: str) -> tuple[int, str] | None:
+    if not text:
+        return None
+    pattern = re.compile(
+        r"(\$|₪|€)?\s*(\d[\d,\.]*)\s*(k|m|אלף|מיליון|usd|ils|eur|שקל|דולר)?",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        symbol, raw_amount, suffix = match.group(1), match.group(2), match.group(3)
+        if not raw_amount or not re.search(r"\d", raw_amount):
+            continue
+        digits_only = raw_amount.replace(",", "").replace(".", "")
+        if not digits_only.isdigit():
+            continue
+        if len(digits_only) < 2 and not (symbol or suffix):
+            continue
+        currency_hint = None
+        if symbol == "$":
+            currency_hint = "USD"
+        elif symbol == "₪":
+            currency_hint = "ILS"
+        elif symbol == "€":
+            currency_hint = "EUR"
+        elif suffix:
+            suffix_lower = suffix.lower()
+            if suffix_lower in {"usd", "דולר"}:
+                currency_hint = "USD"
+            elif suffix_lower in {"ils", "שקל"}:
+                currency_hint = "ILS"
+            elif suffix_lower == "eur":
+                currency_hint = "EUR"
+        combined = f"{symbol or ''}{raw_amount}{suffix or ''}"
+        normalized = _normalize_money_amount(combined, currency_hint)
+        if normalized:
+            return normalized
+    return None
+
+
+def _strip_after_marker(text: str, markers: tuple[str, ...]) -> str:
+    lowered = text.lower()
+    for marker in markers:
+        idx = lowered.find(marker.lower())
+        if idx >= 0:
+            return text[idx + len(marker):].strip(" :,.\u05be-")
+    return ""
+
+
+def _has_any(text: str, terms: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(term.lower() in lowered for term in terms)
+
+
+TOPIC_TERMS: dict[str, tuple[str, ...]] = {
+    "fitness": ("כושר", "fitness", "מסה", "אימון", "training", "muscle", "bulk", "cut", "חיטוב", "משקל", "kg", "ק\"ג", "קג"),
+    "finance": ("כסף", "money", "income", "salary", "משכורת", "savings", "חיסכון", "לחסוך", "save money", "להרוויח", "earn", "revenue", "investment", "השקעה", "להשקיע", "stock", "מניה", "portfolio", "תיק", "$", "₪", "k$"),
+    "career": ("קריירה", "career", "job", "עבודה", "תפקיד", "role", "להיות head", "head of", "promotion", "קידום", "interview", "ראיון", "switch", "transition"),
+    "business": ("business", "עסק", "startup", "סטארטאפ", "saas", "client", "לקוח", "לקוחות", "מוצר", "product", "launch", "השקה", "mrr", "arr", "growth"),
+    "learning": ("learn", "ללמוד", "course", "קורס", "skill", "כישור", "certification", "תעודה", "study", "ללימוד", "language", "שפה", "english", "spanish", "ספרדית", "אנגלית"),
+    "habit": ("habit", "הרגל", "routine", "שגרה", "morning", "בוקר", "sleep", "שינה", "לישון", "meditation", "מדיטציה", "journal", "יומן"),
+    "relationship": ("dating", "דייטים", "girlfriend", "בחורה", "אקס", "אקסית", "relationship", "זוגיות", "love", "אהבה", "marriage", "חתונה"),
+    "lifestyle": ("travel", "טיול", "לעבור", "moving", "apartment", "דירה", "house", "בית", "car", "רכב"),
+    "health": ("sleep", "שינה", "diet", "תזונה", "doctor", "רופא", "supplement", "תוסף", "blood", "דם", "stress", "לחץ"),
+    "ai_project": ("super agent", "benjamin", "בנימין", "ai assistant"),
+}
+
+
+def _detect_topic_terms(text: str) -> set[str]:
+    return {topic for topic, terms in TOPIC_TERMS.items() if _has_any(text, terms)}
+
+
+def _extract_finance_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["finance"]):
+        return []
+    insights: list[dict] = []
+    save_text = _strip_after_marker(text, ("לחסוך", "save", "savings goal", "יעד חיסכון"))
+    income_text = _strip_after_marker(text, ("להרוויח", "earn", "revenue", "income", "משכורת של"))
+    invest_text = _strip_after_marker(text, ("להשקיע", "invest", "portfolio of", "תיק של"))
+
+    def push(key: str, source_text: str, label_he: str, must_term: tuple[str, ...] | None = None) -> None:
+        amount = _find_money_amount(source_text or text)
+        if not amount:
+            return
+        if must_term and not any(t in lowered for t in must_term):
+            pass
+        value, currency = amount
+        formatted = _format_money(value, currency)
+        insights.append(
+            {
+                "memory_type": "strategic",
+                "key": key,
+                "value": f"{label_he}: {formatted}",
+                "summary": f"{label_he}: {formatted}",
+                "confidence": 92,
+                "priority": 8,
+            }
+        )
+
+    if save_text or "חיסכון" in lowered or "savings" in lowered or "לחסוך" in lowered:
+        push("finance_savings_goal", save_text, "יעד חיסכון")
+    if income_text or "income" in lowered or "salary" in lowered or "משכורת" in lowered or "להרוויח" in lowered:
+        push("finance_income_goal", income_text, "יעד הכנסה")
+    if invest_text or "השקעה" in lowered or "invest" in lowered or "portfolio" in lowered:
+        push("finance_investment_goal", invest_text, "יעד השקעה")
+    return insights
+
+
+def _extract_career_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["career"]):
+        return []
+    insights: list[dict] = []
+    role_text = _strip_after_marker(
+        text,
+        ("רוצה להיות", "want to be", "להיות", "become", "מחפש תפקיד", "looking for role", "תפקיד של", "role of"),
+    )
+    if role_text:
+        role_text = role_text.split(".")[0].split(",")[0].strip(" :")[:120]
+    if role_text and len(role_text) >= 3:
+        insights.append(
+            {
+                "memory_type": "strategic",
+                "key": "career_target_role",
+                "value": role_text,
+                "summary": f"יעד קריירה מוצהר: {role_text}",
+                "confidence": 88,
+                "priority": 8,
+            }
+        )
+    if any(term in lowered for term in ("מתחיל עבודה", "starting job", "התחלתי עבודה", "started a job", "got a job", "קיבלתי עבודה")):
+        insights.append(
+            {
+                "memory_type": "temporal",
+                "key": "career_recent_change",
+                "value": text[:240],
+                "summary": "שינוי קריירה אחרון.",
+                "confidence": 85,
+                "priority": 7,
+            }
+        )
+    if any(term in lowered for term in ("עוזב את", "leaving", "התפטר", "quit", "resign")):
+        insights.append(
+            {
+                "memory_type": "temporal",
+                "key": "career_transition",
+                "value": text[:240],
+                "summary": "מעבר קריירה פעיל.",
+                "confidence": 84,
+                "priority": 7,
+            }
+        )
+    return insights
+
+
+def _extract_business_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["business"]):
+        return []
+    insights: list[dict] = []
+    customer_pattern = re.compile(r"(\d{1,5})\s*(?:paying\s+)?(?:לקוחות|customers|users|משתמשים)", flags=re.IGNORECASE)
+    customer_match = customer_pattern.search(text)
+
+    revenue_signal_terms = ("revenue", "mrr", "arr", "income", "$", "₪")
+    money = None
+    revenue_text = _strip_after_marker(text, ("revenue of", "mrr", "arr", "to hit", "to reach", "להגיע ל", "להגיע אל"))
+    revenue_text_clean = customer_pattern.sub("", revenue_text or "")
+    if revenue_text_clean and re.search(r"\d", revenue_text_clean) and any(term in lowered for term in revenue_signal_terms):
+        money = _find_money_amount(revenue_text_clean)
+    if not money and any(term in lowered for term in revenue_signal_terms):
+        candidate_text = customer_pattern.sub("", text)
+        money = _find_money_amount(candidate_text)
+    if money:
+        amount, currency = money
+        formatted = _format_money(amount, currency)
+        insights.append(
+            {
+                "memory_type": "project",
+                "key": "business_revenue_goal",
+                "value": f"יעד הכנסה עסקית: {formatted}",
+                "summary": f"יעד הכנסה עסקית: {formatted}",
+                "confidence": 90,
+                "priority": 8,
+            }
+        )
+    customer_match = customer_pattern.search(text)
+    if customer_match:
+        try:
+            count = int(customer_match.group(1))
+            insights.append(
+                {
+                    "memory_type": "project",
+                    "key": "business_customer_target",
+                    "value": f"יעד לקוחות: {count}",
+                    "summary": f"יעד לקוחות: {count}",
+                    "confidence": 90,
+                    "priority": 7,
+                }
+            )
+        except Exception:
+            pass
+    if "launch" in lowered or "השקה" in lowered:
+        insights.append(
+            {
+                "memory_type": "project",
+                "key": "business_launch_intent",
+                "value": text[:240],
+                "summary": "כוונת השקה מוצהרת.",
+                "confidence": 80,
+                "priority": 7,
+            }
+        )
+    return insights
+
+
+def _extract_learning_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["learning"]):
+        return []
+    insights: list[dict] = []
+    target_text = _strip_after_marker(text, ("ללמוד", "learn", "ללימוד", "studying", "לומד", "מתחיל קורס", "starting course"))
+    if target_text:
+        target_text = target_text.split(".")[0].split(",")[0].strip(" :")[:120]
+    if target_text and len(target_text) >= 2:
+        insights.append(
+            {
+                "memory_type": "project",
+                "key": "learning_focus",
+                "value": target_text,
+                "summary": f"לימוד פעיל: {target_text}",
+                "confidence": 88,
+                "priority": 6,
+            }
+        )
+    return insights
+
+
+def _extract_habit_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["habit"]):
+        return []
+    insights: list[dict] = []
+    if any(term in lowered for term in ("מתחיל", "starting", "התחלתי", "started", "כל יום", "every day", "מדי בוקר", "every morning")):
+        insights.append(
+            {
+                "memory_type": "behavioral",
+                "key": "active_habit",
+                "value": text[:240],
+                "summary": "הרגל פעיל מוצהר.",
+                "confidence": 84,
+                "priority": 6,
+            }
+        )
+    sleep_match = None
+    if any(term in lowered for term in ("שינה", "לישון", "sleep")):
+        sleep_match = re.search(r"(\d{1,2})\s*(?:שעות|hours|hr|h)\b", text, flags=re.IGNORECASE)
+        if not sleep_match:
+            sleep_match = re.search(r"(?:sleep|שינה|לישון)\D{0,15}(\d{1,2})", text, flags=re.IGNORECASE)
+    if sleep_match:
+        try:
+            hours = int(sleep_match.group(1))
+            if 3 <= hours <= 12:
+                insights.append(
+                    {
+                        "memory_type": "behavioral",
+                        "key": "sleep_hours_goal",
+                        "value": f"יעד שינה: {hours} שעות בלילה",
+                        "summary": f"יעד שינה: {hours} שעות.",
+                        "confidence": 88,
+                        "priority": 6,
+                    }
+                )
+        except Exception:
+            pass
+    return insights
+
+
+def _extract_relationship_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["relationship"]):
+        return []
+    insights: list[dict] = []
+    if any(term in lowered for term in ("יוצא עם", "dating", "פגשתי", "met someone", "התחלתי לצאת", "started dating")):
+        insights.append(
+            {
+                "memory_type": "relational",
+                "key": "active_dating_status",
+                "value": text[:240],
+                "summary": "סטטוס דייטינג פעיל.",
+                "confidence": 82,
+                "priority": 6,
+            }
+        )
+    if any(term in lowered for term in ("נפרדנו", "broke up", "סיימנו", "ended it")):
+        insights.append(
+            {
+                "memory_type": "temporal",
+                "key": "recent_relationship_event",
+                "value": text[:240],
+                "summary": "אירוע זוגיות אחרון.",
+                "confidence": 86,
+                "priority": 7,
+            }
+        )
+    if any(term in lowered for term in (" ex", "אקס", "אקסית")):
+        insights.append(
+            {
+                "memory_type": "relational",
+                "key": "ex_dynamic_active",
+                "value": text[:240],
+                "summary": "הקשר עם האקסית עדיין פעיל ברקע.",
+                "confidence": 80,
+                "priority": 7,
+            }
+        )
+    return insights
+
+
+def _extract_lifestyle_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["lifestyle"]):
+        return []
+    insights: list[dict] = []
+    if any(term in lowered for term in ("לעבור ל", "moving to", "מתכנן לעבור", "planning to move")):
+        insights.append(
+            {
+                "memory_type": "temporal",
+                "key": "planned_relocation",
+                "value": text[:240],
+                "summary": "תכנון מעבר מקום מגורים.",
+                "confidence": 85,
+                "priority": 6,
+            }
+        )
+    if any(term in lowered for term in ("טיול", "trip to", "traveling to")):
+        insights.append(
+            {
+                "memory_type": "temporal",
+                "key": "planned_trip",
+                "value": text[:240],
+                "summary": "תכנון טיול.",
+                "confidence": 80,
+                "priority": 5,
+            }
+        )
+    return insights
+
+
+def _extract_health_targets(text: str, lowered: str) -> list[dict]:
+    if not _has_any(text, TOPIC_TERMS["health"]):
+        return []
+    insights: list[dict] = []
+    if any(term in lowered for term in ("רופא", "doctor", "blood test", "בדיקת דם")):
+        insights.append(
+            {
+                "memory_type": "temporal",
+                "key": "health_medical_event",
+                "value": text[:240],
+                "summary": "אירוע רפואי / בדיקה.",
+                "confidence": 82,
+                "priority": 6,
+            }
+        )
+    if any(term in lowered for term in ("דיאטה", "diet", "תזונה")):
+        insights.append(
+            {
+                "memory_type": "behavioral",
+                "key": "nutrition_focus",
+                "value": text[:240],
+                "summary": "פוקוס תזונתי פעיל.",
+                "confidence": 78,
+                "priority": 5,
+            }
+        )
+    return insights
+
+
+def _extract_generic_intent(text: str, lowered: str) -> list[dict]:
+    intent_markers = (
+        "אני מתחיל",
+        "i'm starting",
+        "i am starting",
+        "אני מתכנן",
+        "i plan to",
+        "i'm planning to",
+        "i am planning to",
+        "אני בונה",
+        "i'm building",
+        "i am building",
+        "אני עובד על",
+        "i'm working on",
+        "i am working on",
+    )
+    if not any(marker in lowered for marker in intent_markers):
+        return []
+    return [
+        {
+            "memory_type": "project",
+            "key": "active_intent",
+            "value": text[:240],
+            "summary": "כוונה פעילה שהמשתמש הצהיר עליה.",
+            "confidence": 80,
+            "priority": 6,
+        }
+    ]
+
+
+def extract_rule_based_memory_insights(message: str, conversation_tail: list[dict] | None = None) -> list[dict]:
+    text = (message or "").strip()
+    lowered = text.lower()
+    insights: list[dict] = []
+
+    def add(memory_type: str, key: str, value: str, summary: str, confidence: int, priority: int) -> None:
+        if not value.strip():
+            return
+        candidate = {
+            "memory_type": memory_type,
+            "key": key,
+            "value": value.strip(),
+            "summary": summary.strip(),
+            "confidence": confidence,
+            "priority": priority,
+            "overwrite": True,
+            "evidence": text[:220],
+        }
+        marker = (candidate["memory_type"], _normalize_key(candidate["key"]))
+        if marker not in {(item["memory_type"], _normalize_key(item["key"])) for item in insights}:
+            insights.append(candidate)
+
+    def add_dict(item: dict) -> None:
+        candidate = {
+            "memory_type": item.get("memory_type", "identity"),
+            "key": item.get("key", "general"),
+            "value": str(item.get("value") or "").strip(),
+            "summary": str(item.get("summary") or item.get("value") or "").strip(),
+            "confidence": int(item.get("confidence", 80)),
+            "priority": int(item.get("priority", 5)),
+            "overwrite": bool(item.get("overwrite", True)),
+            "evidence": text[:220],
+        }
+        if not candidate["value"]:
+            return
+        marker = (candidate["memory_type"], _normalize_key(candidate["key"]))
+        if marker not in {(existing["memory_type"], _normalize_key(existing["key"])) for existing in insights}:
+            insights.append(candidate)
+
+    remembered_text = ""
+    if lowered.startswith(("חשוב שתדע ש", "חשוב שתדעי ש")):
+        remembered_text = re.sub(r"^(חשוב שתדע ש|חשוב שתדעי ש)\s*", "", text).strip()
+    elif lowered.startswith(("המטרה שלי היא", "my goal is")):
+        remembered_text = re.sub(r"^(המטרה שלי היא|my goal is)\s*", "", text, flags=re.IGNORECASE).strip()
+        if _is_meaningful_goal_text(remembered_text):
+            add("strategic", "stated_primary_goal", remembered_text, "Explicitly stated current goal.", 92, 8)
+    elif lowered.startswith(("אני רוצה", "i want to")):
+        remembered_text = re.sub(r"^(אני רוצה|i want to)\s*", "", text, flags=re.IGNORECASE).strip()
+        if _is_meaningful_goal_text(remembered_text):
+            add("strategic", "stated_goal", remembered_text, "User stated a goal directly.", 84, 6)
+
+    weights = _extract_weight_targets(text)
+    fitness_terms = ("mass gain", "muscle gain", "bulk", "lean bulk", "מסה", "לעלות", "כושר", "training")
+    if weights and any(term in lowered for term in fitness_terms):
+        current_weight, target_weight = weights
+        goal_type = "muscle_gain"
+        add(
+            "project",
+            "fitness_goal",
+            f"מטרת הכושר הפעילה היא עלייה במסה מ-{current_weight} ל-{target_weight} ק\"ג.",
+            f"מטרת כושר פעילה: עלייה במסה מ-{current_weight} ל-{target_weight} ק\"ג.",
+            97,
+            9,
+        )
+        add("project", "current_weight_kg", str(current_weight), f"משקל נוכחי: {current_weight} ק\"ג.", 97, 8)
+        add("project", "target_weight_kg", str(target_weight), f"משקל יעד: {target_weight} ק\"ג.", 97, 8)
+        add("project", "goal_type", goal_type, "סוג יעד הכושר: עלייה במסה.", 96, 8)
+        add("project", "fitness_status", "active", "יעד הכושר כרגע פעיל.", 95, 7)
+
+    for extractor in (
+        _extract_finance_targets,
+        _extract_career_targets,
+        _extract_business_targets,
+        _extract_learning_targets,
+        _extract_habit_targets,
+        _extract_relationship_targets,
+        _extract_lifestyle_targets,
+        _extract_health_targets,
+        _extract_generic_intent,
+    ):
+        for item in extractor(text, lowered) or []:
+            add_dict(item)
+
+    if remembered_text and _is_meaningful_goal_text(remembered_text):
+        if not any(item["key"] == "stated_primary_goal" for item in insights):
+            add("identity", "important_user_note", remembered_text, "Important direct fact the user asked Benjamin to remember.", 88, 6)
+
+    if lowered.startswith(("תזכור", "תזכרי", "remember")) and re.fullmatch(r"(תזכור|תזכרי|remember)(:)?\s*(את זה|זה|this)?", lowered):
+        source_text = ""
+        for item in reversed(conversation_tail or []):
+            if not isinstance(item, dict):
+                continue
+            candidate = _normalize_text(item.get("content"), limit=220)
+            if candidate and candidate.casefold() not in {"תזכור את זה", "remember this"}:
+                source_text = candidate
+                break
+        if source_text:
+            add("temporal", "remembered_context", source_text, "User asked to remember recent context.", 82, 5)
+
+    return insights[:10]
+
+
 def _tokenize(text: str) -> list[str]:
     return [token for token in re.findall(r"[\w\u0590-\u05FF]{2,}", (text or "").lower()) if len(token) >= 2]
 
@@ -1158,43 +1765,53 @@ def seed_user_core_profile(user_id: str) -> None:
 def store_memory_insight(user_id: str, insight: dict, *, source: str = "interaction_learning") -> dict | None:
     if not isinstance(insight, dict):
         return None
-    memory_type = _normalize_memory_type(insight.get("memory_type") or insight.get("type"))
-    key = _normalize_key(insight.get("key"))
-    value = str(insight.get("value") or "").strip()
-    if not key or not value:
+    normalized = _normalize_stored_memory_payload(insight)
+    if not normalized["key"] or not normalized["value"]:
         return None
-    summary = _normalize_text(insight.get("summary") or value, limit=400)
-    confidence = int(insight.get("confidence", 75))
-    priority = int(insight.get("priority", 4))
-    overwrite = bool(insight.get("overwrite") or insight.get("override"))
-    evidence = _normalize_text(insight.get("evidence") or "", limit=500)
-    conn = _get_conn()
     try:
-        _upsert_memory_row(
-            conn,
-            user_id=user_id,
-            memory_type=memory_type,
-            key=key,
-            value=value,
-            summary=summary,
-            confidence=confidence,
-            priority=priority,
-            source=source,
-            overwrite=overwrite,
-            evidence=evidence,
+        conn = _get_conn()
+        try:
+            _upsert_memory_row(
+                conn,
+                user_id=user_id,
+                memory_type=normalized["memory_type"],
+                key=normalized["key"],
+                value=normalized["value"],
+                summary=normalized["summary"],
+                confidence=normalized["confidence"],
+                priority=normalized["priority"],
+                source=source,
+                overwrite=normalized["overwrite"],
+                evidence=normalized["evidence"],
+            )
+            _write_legacy_memory(
+                conn,
+                user_id,
+                normalized["memory_type"],
+                normalized["key"],
+                normalized["value"],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _refresh_derived_state(user_id)
+    except Exception:
+        _append_memory_fallback(
+            {
+                "event": "memory_write_failed",
+                "user_id": str(user_id),
+                "source": source,
+                "memory": normalized,
+                "created_at": _now_ts(),
+            }
         )
-        _write_legacy_memory(conn, user_id, memory_type, key, value)
-        conn.commit()
-    finally:
-        conn.close()
-    _refresh_derived_state(user_id)
     return {
-        "memory_type": memory_type,
-        "key": key,
-        "value": value,
-        "summary": summary,
-        "confidence": confidence,
-        "priority": priority,
+        "memory_type": normalized["memory_type"],
+        "key": normalized["key"],
+        "value": normalized["value"],
+        "summary": normalized["summary"],
+        "confidence": normalized["confidence"],
+        "priority": normalized["priority"],
     }
 
 
@@ -1212,23 +1829,35 @@ def learn_from_interaction(
             stored.append(saved)
 
     if stored:
-        conn = _get_conn()
         try:
-            conn.execute(
-                """
-                INSERT INTO memory_learning_events(user_id, message_excerpt, learned_json, created_at)
-                VALUES(?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    _normalize_text(message, limit=500),
-                    json.dumps(stored, ensure_ascii=False),
-                    _now_ts(),
-                ),
+            conn = _get_conn()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO memory_learning_events(user_id, message_excerpt, learned_json, created_at)
+                    VALUES(?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        _normalize_text(message, limit=500),
+                        json.dumps(stored, ensure_ascii=False),
+                        _now_ts(),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            _append_memory_fallback(
+                {
+                    "event": "learning_event_write_failed",
+                    "user_id": str(user_id),
+                    "source": source,
+                    "message_excerpt": _normalize_text(message, limit=500),
+                    "learned": stored,
+                    "created_at": _now_ts(),
+                }
             )
-            conn.commit()
-        finally:
-            conn.close()
     return stored
 
 
@@ -1364,6 +1993,72 @@ def _build_retrieval_summary(query: str, memory_layers: dict[str, list[dict]]) -
         "strategic": [item.get("summary") or item.get("value") for item in memory_layers.get("strategic", [])[:3]],
         "query": _normalize_text(query, limit=120),
     }
+
+
+def _build_response_guidance(query: str, memory_layers: dict[str, list[dict]]) -> list[str]:
+    text = (query or "").lower()
+    guidance: list[str] = []
+
+    def values(layer: str) -> list[str]:
+        return [
+            str(item.get("summary") or item.get("value") or "").strip()
+            for item in memory_layers.get(layer, [])[:4]
+            if str(item.get("summary") or item.get("value") or "").strip()
+        ]
+
+    if any(term in text for term in ("אקס", "אקסית", "ex", "dating", "זוג", "קשר", "בחורה", "דייט")):
+        guidance.append("Personal advice mode: do not answer generically or with a vague follow-up question.")
+        for item in values("relational")[:2]:
+            guidance.append(f"Relationship anchor: {item}")
+        for item in values("behavioral")[:2]:
+            guidance.append(f"Behavioral anchor: {item}")
+        guidance.append("Use the user's known rumination patterns, closure difficulty, and emotional loops if relevant.")
+
+    if any(term in text for term in ("career", "קריירה", "עבודה", "מסלול", "מקצועי", "תפקיד", "promotion", "קידום")):
+        guidance.append("Career advice mode: anchor to ambition, leverage-seeking, dislike of mediocrity, and focus-vs-dispersion tradeoff.")
+        for item in values("strategic")[:2]:
+            guidance.append(f"Career anchor: {item}")
+
+    if any(term in text for term in ("כסף", "money", "income", "salary", "משכורת", "savings", "חיסכון", "investment", "השקעה", "finance", "פיננסי")):
+        guidance.append("Finance advice mode: anchor to leverage mindset, ambition, and dislike of static safe paths. If a stored finance goal exists, lead with it.")
+        for item in values("strategic")[:2]:
+            guidance.append(f"Finance anchor: {item}")
+
+    if any(term in text for term in ("עסק", "business", "startup", "סטארטאפ", "saas", "מוצר", "product", "launch", "השקה", "לקוחות", "customers", "mrr", "arr")):
+        guidance.append("Business advice mode: anchor to leverage, audacity, dislike of slow grind, and the focus-vs-dispersion tradeoff. Prefer concrete next move.")
+        for item in values("project")[:2]:
+            guidance.append(f"Business anchor: {item}")
+
+    if any(term in text for term in ("ללמוד", "learn", "course", "קורס", "skill", "כישור", "study", "לימוד")):
+        guidance.append("Learning advice mode: anchor to user's pattern of dispersion vs depth. Push toward 1 focused track, not parallel exploration.")
+        for item in values("project")[:1]:
+            guidance.append(f"Learning anchor: {item}")
+
+    if any(term in text for term in ("הרגל", "habit", "routine", "שגרה", "discipline", "משמעת", "עקביות", "consistency")):
+        guidance.append("Discipline advice mode: anchor to user's known weakness — strong intent + weak follow-through. Push micro-habits over heroic plans.")
+        for item in values("behavioral")[:2]:
+            guidance.append(f"Behavioral anchor: {item}")
+
+    if any(term in text for term in ("שינה", "sleep", "תזונה", "diet", "בריאות", "health", "אנרגיה", "energy", "stress", "לחץ")):
+        guidance.append("Health advice mode: tie answer to user's energy / focus / momentum, not generic wellness tropes.")
+        for item in values("behavioral")[:1]:
+            guidance.append(f"Health anchor: {item}")
+
+    if any(term in text for term in ("טיול", "travel", "לעבור", "moving", "דירה", "apartment", "house", "בית", "רכב", "car")):
+        guidance.append("Lifestyle decision mode: anchor to user's life-phase (transitional, hungry to level up) and ambition vs comfort.")
+        for item in values("temporal")[:2]:
+            guidance.append(f"Lifestyle anchor: {item}")
+
+    if any(term in text for term in ("כושר", "fitness", "מסה", "bulk", "muscle", "weight", "משקל", "חיטוב", "אימון", "training")):
+        guidance.append("Fitness recall mode: if there is a stored active fitness goal, answer directly with the concrete target.")
+
+    if any(term in text for term in ("מטרה", "יעד", "goal", "target")):
+        guidance.append("Goal recall mode: if a relevant stored goal exists, lead with the exact stored value before adding context.")
+
+    if any(term in text for term in ("מה אתה זוכר", "what do you remember", "מי אני")):
+        guidance.append("Self-context mode: list 3–5 of the most relevant identity / strategic / project anchors, not the full profile dump.")
+
+    return guidance[:12]
 
 
 def build_user_brief(
@@ -1502,6 +2197,7 @@ def load_memory_context_snapshot(
         memory_layers=memory_layers,
     )
     retrieval_summary = _build_retrieval_summary(query, memory_layers)
+    response_guidance = _build_response_guidance(query, memory_layers)
     return {
         "user_profile": profile,
         "user_brief": user_brief,
@@ -1512,6 +2208,7 @@ def load_memory_context_snapshot(
         "conversation_tail": conversation_tail or [],
         "memory_layers": memory_layers,
         "retrieval_summary": retrieval_summary,
+        "response_guidance": response_guidance,
         "full_core_profile": EXPANDED_CORE_PROFILE_TEXT,
     }
 
@@ -1544,6 +2241,7 @@ def format_memory_for_prompt(
     add_section("Relationship Context", retrieval_summary.get("relationships") or [])
     add_section("Recent Changes", retrieval_summary.get("recent_changes") or [])
     add_section("Strategic Priorities", retrieval_summary.get("strategic") or [])
+    add_section("Response Guidance", memory_context.get("response_guidance") or [])
 
     if detailed:
         for memory_type in MEMORY_TYPES:
