@@ -57,7 +57,7 @@ class PlanningAgent(BaseAgent):
             return result
 
         prompt = (
-            "You are a planning agent for Benjamin. Build a short practical plan.\n"
+            "You are Benjamin's planning agent. Build a short practical plan.\n"
             "Return JSON only with this shape:\n"
             "{\n"
             '  "objective": "one short sentence",\n'
@@ -68,7 +68,8 @@ class PlanningAgent(BaseAgent):
             "}\n"
             "Rules:\n"
             "- Keep 2-5 steps.\n"
-            "- Be concise and concrete.\n"
+            "- Be concise, concrete, and practical.\n"
+            "- Favor operator-style next steps over generic analysis.\n"
             "- Use only these agent names in recommended_agent_sequence: research, memory, planning, execution, verification, code, finance, assistant, fitness_health, relationships, business_strategy, ai_expert.\n"
             f"- User task: {message}\n"
         )

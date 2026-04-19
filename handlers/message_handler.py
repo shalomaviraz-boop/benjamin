@@ -14,6 +14,9 @@ from memory.memory_store import (
     get_personal_model,
     upsert_personal_model,
     update_personal_model_field,
+    build_user_brief,
+    load_memory_context_snapshot,
+    seed_user_core_profile,
 )
 from orchestrator.benjamin_orchestrator import BenjaminOrchestrator
 
@@ -118,63 +121,17 @@ def _pick_memory_values(memories: list[dict], *, types: set[str] | None = None, 
 
 
 def _build_user_brief(profile: dict | None, personal_model: dict, recent_memories: list[dict], project_state: dict | None) -> dict:
-    brief: dict = {}
-    profile = profile or {}
-    project_state = project_state or {}
-
-    communication_style = personal_model.get("communication_style") or personal_model.get("tone") or personal_model.get("style")
-    if communication_style:
-        brief["communication_style"] = communication_style
-
-    preferences = _coerce_list(personal_model.get("preferences"))
-    preferences.extend(_pick_memory_values(recent_memories, types={"preference"}, limit=5))
-    if preferences:
-        brief["preferences"] = list(dict.fromkeys(preferences))[:5]
-
-    dislikes = _coerce_list(personal_model.get("dislikes"))
-    dislikes.extend(_pick_memory_values(recent_memories, types={"dislike"}, key_terms=("dislike", "hate", "avoid"), limit=5))
-    if dislikes:
-        brief["dislikes"] = list(dict.fromkeys(dislikes))[:5]
-
-    active_projects = _coerce_list(project_state.get("active_projects"))
-    active_projects.extend(_pick_memory_values(recent_memories, types={"project"}, limit=5))
-    if active_projects:
-        brief["active_projects"] = list(dict.fromkeys(active_projects))[:5]
-
-    recurring_goals = _coerce_list(personal_model.get("recurring_goals"))
-    recurring_goals.extend(_coerce_list(personal_model.get("goals")))
-    recurring_goals.extend(_pick_memory_values(recent_memories, key_terms=("goal", "target"), limit=5))
-    if recurring_goals:
-        brief["recurring_goals"] = list(dict.fromkeys(recurring_goals))[:5]
-
-    decision_patterns = _coerce_list(personal_model.get("decision_patterns"))
-    if decision_patterns:
-        brief["decision_patterns"] = decision_patterns[:4]
-
-    if profile.get("name"):
-        brief["name"] = profile["name"]
-
-    return brief
+    return build_user_brief(profile, personal_model, recent_memories, project_state)
 
 
 def _load_memory_context(user_id: str, message: str) -> dict:
     """Load user profile + relevant memories + project state for prompts."""
-    profile = get_profile(user_id)
-    personal_model = get_personal_model(user_id) or {}
-    relevant_memories = search_memories(user_id, message, limit=8)
-    recent_memories = list_memories(user_id, limit=10)
-    project_state = get_project_state(user_id)
     conversation_tail = _get_tail(user_id, limit=15)
-    user_brief = _build_user_brief(profile, personal_model, recent_memories, project_state)
-    return {
-        "user_profile": profile,
-        "user_brief": user_brief,
-        "personal_model": personal_model,
-        "relevant_memories": relevant_memories,
-        "recent_memories": recent_memories,
-        "project_state": project_state,
-        "conversation_tail": conversation_tail,
-    }
+    return load_memory_context_snapshot(
+        user_id,
+        message,
+        conversation_tail=conversation_tail,
+    )
 
 
 def _persist_memory(user_id: str, plan: dict) -> None:
@@ -292,6 +249,7 @@ class BenjaminMessageHandler:
     async def handle(self, message: str, user_id: str) -> str:
         normalized = message.strip().lower()
         trimmed = message.strip()
+        seed_user_core_profile(user_id)
 
         # Kill switch
         if normalized in KILL_PHRASES:

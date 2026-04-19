@@ -1,4 +1,4 @@
-"""GPT-4 client for orchestration, sanity check, and voice pass."""
+"""GPT-4 client for orchestration and legacy helpers."""
 import json
 import os
 from openai import AsyncOpenAI
@@ -12,7 +12,7 @@ MODELS = [
 
 
 class GPTClient:
-    """GPT client for routing, sanity check, and voice pass."""
+    """GPT client for routing and legacy helpers."""
 
     def __init__(self):
         self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -109,45 +109,9 @@ ISSUES: [list 1-3 specific issues if NO, or "None"]
         review: str = "",
         force_hebrew: bool = False,
     ) -> str:
-        """Final voice pass - make content sound natural and consistent."""
-        review_part = f"\nReview: {review}" if review else ""
-        lang_rule = (
-            "CRITICAL: Answer ONLY in Hebrew. No English."
-            if force_hebrew
-            else "If the question/context is in Hebrew, answer in Hebrew. Match input language."
-        )
-        prompt = f"""You are Benjamin's voice.
+        """Legacy compatibility helper.
 
-Content from {expert_name}:
-{content}
-{review_part}
-
-Your job:
-✅ Align style (friendly, clear, natural)
-✅ Check contradictions
-✅ Ensure it answers the question
-❌ DO NOT summarize/shorten
-❌ DO NOT remove important details
-❌ DO NOT change facts
-❌ DO NOT add follow-up questions
-❌ DO NOT add small talk
-
-Just answer directly. Keep ALL info from expert.
-{lang_rule}
-
-If content has timestamp/confidence - KEEP THEM!
-"""
-
-        for model_name in MODELS:
-            try:
-                response = await self.client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.5,
-                )
-                return response.choices[0].message.content.strip()
-            except Exception as e:
-                logger.warning(f"GPT {model_name} voice_pass failed: {e}")
-                continue
-
-        raise Exception("All GPT models failed for voice_pass")
+        Disabled by default so Benjamin does not silently rewrite outputs into bot voice.
+        """
+        _ = (expert_name, review, force_hebrew)
+        return (content or "").strip()

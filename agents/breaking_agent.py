@@ -10,6 +10,7 @@ from pathlib import Path
 from telegram.ext import ContextTypes
 
 from experts.gemini_client import generate_web
+from memory.memory_store import load_memory_context_snapshot
 
 from agents.memory_agent import MemoryAgent
 from agents.priority_agent import PriorityAgent
@@ -309,6 +310,15 @@ class BreakingAgent:
             text += f"\n\n🎯 למה זה חשוב:\n{why_it_matters}"
         return text
 
+    def build_personal_candidate(self, verified: dict, scored: dict) -> dict:
+        return {
+            "category": _normalize_category(verified.get("category")),
+            "headline": (verified.get("headline") or "").strip(),
+            "summary": (verified.get("summary") or "").strip(),
+            "why_relevant": (verified.get("why_it_matters") or "").strip() or (scored.get("reason") or "").strip(),
+            "opportunity": (scored.get("opportunity") or "").strip(),
+        }
+
     async def run_check(
         self,
         context: ContextTypes.DEFAULT_TYPE,
@@ -321,6 +331,10 @@ class BreakingAgent:
             chat_id = context.job.data.get("chat_id")
             if not chat_id:
                 return
+            memory_context = load_memory_context_snapshot(
+                str(chat_id),
+                "breaking alert ai markets business super agent",
+            )
 
             raw_candidate = await self.detect()
             candidate = _extract_json_object(raw_candidate)
@@ -334,7 +348,7 @@ class BreakingAgent:
             if not self.should_send(verified):
                 return
 
-            scored = await priority.score_event(verified)
+            scored = await priority.score_event(verified, memory_context=memory_context)
             print(f"Priority score: {scored.get('priority_score')}")
             if not scored.get("should_send"):
                 return
@@ -353,8 +367,13 @@ class BreakingAgent:
             ):
                 return
 
-            text = self.format_text(verified)
-            text = await quality.polish(text)
+            candidate = self.build_personal_candidate(verified, scored)
+            text = await quality.render_proactive_message(
+                candidate=candidate,
+                memory_context=memory_context,
+            )
+            if not text.strip():
+                text = self.format_text(verified)
 
             await context.bot.send_message(chat_id=chat_id, text=text)
             _mark_cluster(cluster_key, category)

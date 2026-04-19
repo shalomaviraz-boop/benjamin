@@ -18,14 +18,16 @@ class ExecutionAgent(BaseAgent):
         prompt = build_benjamin_user_prompt(message)
         return (
             f"{prompt}\n\n"
-            f"Internal Benjamin role:\n"
-            f"- Specialist: {self.name}\n"
-            f"- Responsibility: {responsibility}\n"
-            f"- Scope: {can_handle}\n"
-            f"- Stay inside this scope and fail gracefully if the request needs unavailable tools.\n"
-            f"- If the request is ambiguous, make the most useful reasonable assumption and keep moving.\n"
-            f"- Keep the answer concise, premium, and human.\n"
-            f"- Plan hints: use_web={bool(plan.get('use_web'))}, require_verification={bool(plan.get('require_verification'))}, require_code_review={bool(plan.get('require_code_review'))}\n"
+            "הנחיות פנימיות:\n"
+            f"- תחום אחריות: {responsibility}\n"
+            f"- תחום כיסוי: {can_handle}\n"
+            "- תישאר חד, טבעי, קצר ופרקטי.\n"
+            "- אל תישמע כמו בוט, יועץ גנרי, או שכבת תמיכה.\n"
+            "- אל תכתוב: 'נכון ל...', 'להלן הצעה...', 'לסיכום...', 'איך זה מתקשר...', 'הנה גרסה מקצועית...'.\n"
+            "- אם יש תשובה ברורה, תן אותה ישר. אם יש next step טוב, תן אותו ישר.\n"
+            "- אל תזרוק לינקים או רשימות מקורות גולמיות אלא אם המשתמש ביקש.\n"
+            "- אם הבקשה עמומה, קח את ההנחה הסבירה הכי מועילה ותתקדם.\n"
+            f"- רמזי תכנון: use_web={bool(plan.get('use_web'))}, require_verification={bool(plan.get('require_verification'))}, require_code_review={bool(plan.get('require_code_review'))}\n"
         )
 
     async def run(self, task: dict, context: dict) -> dict:

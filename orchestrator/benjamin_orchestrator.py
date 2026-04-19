@@ -165,10 +165,10 @@ class BenjaminOrchestrator:
         tools = plan.get("tools_required", [])
 
         lines = []
-        lines.append("נדרש אישור לפני ביצוע.")
-        lines.append(f"רמת אוטומציה מוצעת: Level {level}.")
+        lines.append("צריך אישור לפני שאני ממשיך.")
+        lines.append(f"רמת האוטומציה המוצעת: Level {level}.")
         if reason:
-            lines.append(f"סיבה: {reason}")
+            lines.append(f"למה: {reason}")
         if tools:
             lines.append(f"כלים נדרשים: {', '.join(tools)}")
 
@@ -191,7 +191,7 @@ class BenjaminOrchestrator:
             value = _shorten(str(mem.get("value") or ""), 120)
 
             lines.append("")
-            lines.append("המערכת מציעה לשמור זיכרון:")
+            lines.append("אני מציע לשמור את זה לזיכרון:")
             lines.append(f"type: {mtype}")
             lines.append(f"key: {key}")
             lines.append(f"value: {value}")

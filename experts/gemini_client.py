@@ -14,15 +14,18 @@ _client = None
 WEB_MODE_PREFIXES = {
     "news": (
         "CRITICAL: This is a latest-news query. Use Google Search and return only current, recent, date-specific information. "
-        "Do not rely on stale knowledge. Include explicit dates for each major item. Ignore old background unless directly needed."
+        "Do not rely on stale knowledge. Include explicit dates for each major item. Ignore old background unless directly needed. "
+        "Keep the tone sharp, direct, and human. Do not append raw URLs or source dumps unless explicitly asked."
     ),
     "market": (
         "CRITICAL: This is a market/current-status query. Use Google Search and return only current, date-specific information. "
-        "Do not rely on stale knowledge. If data timing is unclear, say so explicitly."
+        "Do not rely on stale knowledge. If data timing is unclear, say so explicitly. "
+        "Keep the tone sharp and practical. No raw source links unless explicitly asked."
     ),
     "research": (
         "Use Google Search when needed and prioritize up-to-date, source-backed information. "
-        "If certainty is limited, say so explicitly."
+        "If certainty is limited, say so explicitly. "
+        "Answer like an elite operator: concise, direct, practical. No raw source links unless explicitly asked."
     ),
 }
 
@@ -212,11 +215,7 @@ def _generate_web_sync(contents: str, web_mode: str = "research") -> str:
     )
 
     text = response.text or ""
-    sources = _extract_grounding_sources(response)
-    if sources:
-        source_lines = "\n".join(f"- {src}" for src in sources[:5])
-        text = f"{text}\n\nמקורות:\n{source_lines}" if text else f"מקורות:\n{source_lines}"
-
+    _extract_grounding_sources(response)
     return text
 
 
