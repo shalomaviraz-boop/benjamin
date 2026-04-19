@@ -12,6 +12,22 @@ def _now_ts() -> int:
     return int(time.time())
 
 
+def _serialize_payload(value: dict | list | str) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _deserialize_payload(raw: str) -> dict | list | str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(
         DB_PATH,
@@ -109,8 +125,10 @@ def get_profile(user_id: str) -> dict | None:
         ).fetchone()
         if not row or not row["profile_json"]:
             return None
-        # stored as text; keep as-is (caller may store JSON str or dict str)
-        return {"profile_json": row["profile_json"]}
+        data = _deserialize_payload(row["profile_json"])
+        if isinstance(data, dict):
+            return data
+        return {"raw": data}
     finally:
         conn.close()
 
@@ -126,7 +144,7 @@ def upsert_profile(user_id: str, profile: dict | str) -> None:
               profile_json=excluded.profile_json,
               updated_at=excluded.updated_at
             """,
-            (user_id, str(profile), _now_ts()),
+            (user_id, _serialize_payload(profile), _now_ts()),
         )
         conn.commit()
     finally:
@@ -142,7 +160,10 @@ def get_project_state(user_id: str) -> dict | None:
         ).fetchone()
         if not row or not row["state_json"]:
             return None
-        return {"state_json": row["state_json"]}
+        data = _deserialize_payload(row["state_json"])
+        if isinstance(data, dict):
+            return data
+        return {"raw": data}
     finally:
         conn.close()
 
@@ -158,7 +179,7 @@ def upsert_project_state(user_id: str, state: dict | str) -> None:
               state_json=excluded.state_json,
               updated_at=excluded.updated_at
             """,
-            (user_id, str(state), _now_ts()),
+            (user_id, _serialize_payload(state), _now_ts()),
         )
         conn.commit()
     finally:

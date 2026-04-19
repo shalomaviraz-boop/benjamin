@@ -88,6 +88,75 @@ def _get_tail(user_id: str, limit: int = 15) -> list[dict]:
     return [{"role": r[0], "content": r[1]} for r in rows]
 
 
+def _coerce_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _pick_memory_values(memories: list[dict], *, types: set[str] | None = None, key_terms: tuple[str, ...] = (), limit: int = 4) -> list[str]:
+    picked: list[str] = []
+    for mem in memories:
+        if not isinstance(mem, dict):
+            continue
+        mtype = str(mem.get("type") or "").strip().lower()
+        key = str(mem.get("key") or "").strip().lower()
+        value = str(mem.get("value") or "").strip()
+        if not value:
+            continue
+        if types and mtype not in types:
+            continue
+        if key_terms and not any(term in key for term in key_terms):
+            continue
+        if value not in picked:
+            picked.append(value)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def _build_user_brief(profile: dict | None, personal_model: dict, recent_memories: list[dict], project_state: dict | None) -> dict:
+    brief: dict = {}
+    profile = profile or {}
+    project_state = project_state or {}
+
+    communication_style = personal_model.get("communication_style") or personal_model.get("tone") or personal_model.get("style")
+    if communication_style:
+        brief["communication_style"] = communication_style
+
+    preferences = _coerce_list(personal_model.get("preferences"))
+    preferences.extend(_pick_memory_values(recent_memories, types={"preference"}, limit=5))
+    if preferences:
+        brief["preferences"] = list(dict.fromkeys(preferences))[:5]
+
+    dislikes = _coerce_list(personal_model.get("dislikes"))
+    dislikes.extend(_pick_memory_values(recent_memories, types={"dislike"}, key_terms=("dislike", "hate", "avoid"), limit=5))
+    if dislikes:
+        brief["dislikes"] = list(dict.fromkeys(dislikes))[:5]
+
+    active_projects = _coerce_list(project_state.get("active_projects"))
+    active_projects.extend(_pick_memory_values(recent_memories, types={"project"}, limit=5))
+    if active_projects:
+        brief["active_projects"] = list(dict.fromkeys(active_projects))[:5]
+
+    recurring_goals = _coerce_list(personal_model.get("recurring_goals"))
+    recurring_goals.extend(_coerce_list(personal_model.get("goals")))
+    recurring_goals.extend(_pick_memory_values(recent_memories, key_terms=("goal", "target"), limit=5))
+    if recurring_goals:
+        brief["recurring_goals"] = list(dict.fromkeys(recurring_goals))[:5]
+
+    decision_patterns = _coerce_list(personal_model.get("decision_patterns"))
+    if decision_patterns:
+        brief["decision_patterns"] = decision_patterns[:4]
+
+    if profile.get("name"):
+        brief["name"] = profile["name"]
+
+    return brief
+
+
 def _load_memory_context(user_id: str, message: str) -> dict:
     """Load user profile + relevant memories + project state for prompts."""
     profile = get_profile(user_id)
@@ -96,8 +165,10 @@ def _load_memory_context(user_id: str, message: str) -> dict:
     recent_memories = list_memories(user_id, limit=10)
     project_state = get_project_state(user_id)
     conversation_tail = _get_tail(user_id, limit=15)
+    user_brief = _build_user_brief(profile, personal_model, recent_memories, project_state)
     return {
         "user_profile": profile,
+        "user_brief": user_brief,
         "personal_model": personal_model,
         "relevant_memories": relevant_memories,
         "recent_memories": recent_memories,
@@ -289,8 +360,12 @@ class BenjaminMessageHandler:
                 if override or field not in existing_model:
                     update_personal_model_field(user_id, field, value)
                     # refresh local copy
-                    memory_context["personal_model"] = (
-                        get_personal_model(user_id) or {}
+                    memory_context["personal_model"] = get_personal_model(user_id) or {}
+                    memory_context["user_brief"] = _build_user_brief(
+                        memory_context.get("user_profile"),
+                        memory_context["personal_model"],
+                        memory_context.get("recent_memories") or [],
+                        memory_context.get("project_state"),
                     )
                     print(f"Auto-learned field: {field}={value}")
         except Exception as e:
@@ -322,8 +397,12 @@ class BenjaminMessageHandler:
         memories = list_memories(user_id, limit=15)
         profile = get_profile(user_id)
         state = get_project_state(user_id)
+        personal_model = get_personal_model(user_id) or {}
+        user_brief = _build_user_brief(profile, personal_model, memories, state)
 
         lines: list[str] = []
+        if user_brief:
+            lines.append("תקציר אישי: " + str(user_brief)[:240])
         if profile:
             lines.append("פרופיל: " + str(profile)[:200])
 

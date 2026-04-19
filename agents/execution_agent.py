@@ -3,13 +3,30 @@
 from agents.agent_context import read_shared_context
 from agents.agent_contract import build_agent_result
 from agents.base_agent import BaseAgent
-from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
+from experts.model_router import model_router
 from utils.benjamin_identity import build_benjamin_user_prompt
 
 
 class ExecutionAgent(BaseAgent):
     def __init__(self):
         super().__init__("execution", "Executes task prompts using existing generation flow.")
+
+    def _build_domain_prompt(self, message: str, plan: dict) -> str:
+        capability = self.capabilities or {}
+        responsibility = capability.get("responsibility") or self.description or self.name
+        can_handle = ", ".join(capability.get("can_handle") or [])
+        prompt = build_benjamin_user_prompt(message)
+        return (
+            f"{prompt}\n\n"
+            f"Internal Benjamin role:\n"
+            f"- Specialist: {self.name}\n"
+            f"- Responsibility: {responsibility}\n"
+            f"- Scope: {can_handle}\n"
+            f"- Stay inside this scope and fail gracefully if the request needs unavailable tools.\n"
+            f"- If the request is ambiguous, make the most useful reasonable assumption and keep moving.\n"
+            f"- Keep the answer concise, premium, and human.\n"
+            f"- Plan hints: use_web={bool(plan.get('use_web'))}, require_verification={bool(plan.get('require_verification'))}, require_code_review={bool(plan.get('require_code_review'))}\n"
+        )
 
     async def run(self, task: dict, context: dict) -> dict:
         shared = read_shared_context(task, context)
@@ -32,15 +49,22 @@ class ExecutionAgent(BaseAgent):
             return result
 
         try:
-            prompt = build_benjamin_user_prompt(message)
-            if use_web:
-                output = await generate_web(prompt, memory_context=memory_context)
-            else:
-                output = await generate_fast(prompt, memory_context=memory_context)
+            task_type = str(task.get("type") or self.name or "execution")
+            web_mode = "news" if task_type in {"research", "ai_expert"} else "market" if task_type == "finance" else "research"
+            prompt = self._build_domain_prompt(message, plan)
+            output, provider = await model_router.generate(
+                prompt=prompt,
+                task_type=task_type,
+                memory_context=memory_context,
+                use_web=use_web,
+                require_code_review=bool(plan.get("require_code_review")),
+                require_verification=bool(plan.get("require_verification")),
+                web_mode=web_mode,
+            )
             result = build_agent_result(
                 agent=self.name,
                 output=output,
-                notes=f"model={FAST_MODEL}, use_web={use_web}",
+                notes=f"provider={provider}, use_web={use_web}",
                 agent_context=shared.to_dict(),
             )
             shared.execution_output = result

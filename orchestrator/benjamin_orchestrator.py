@@ -16,7 +16,7 @@ from typing import Any
 
 from agents.agent_context import AgentContextState
 from agents.registry import registry as agent_registry
-from experts.gemini_client import FAST_MODEL, generate_fast, generate_web
+from experts.model_router import model_router
 from experts.gpt_orchestrator import GPTOrchestrator  # decide(message, memory_context) -> dict
 from experts.claude_client import sanity_check_answer, review_and_improve_code
 from utils.benjamin_identity import build_benjamin_user_prompt
@@ -135,7 +135,7 @@ class BenjaminOrchestrator:
         Run Personal Governor analysis (internal, before execution).
         """
         memory_context = memory_context or {}
-        personal_model = memory_context.get("user_profile") or {}
+        personal_model = memory_context.get("personal_model") or {}
         g = await self.router.analyze_governor(message, personal_model=personal_model)
         print(f"Governor decision: {g}")
         return g
@@ -658,27 +658,32 @@ class BenjaminOrchestrator:
     async def _execute_direct(self, message: str, plan: dict, context: dict) -> str:
         """
         Direct execution (levels 0-2):
-        - Gemini fast or web
+        - task-aware provider routing
         - optional Claude verification
         - optional Claude code review
-        - optional single refinement pass (if Claude changes output)
+        - optional single refinement pass
         """
         memory_context = context.get("memory_context")
-
-        model_used = FAST_MODEL
         use_web = bool(plan.get("use_web"))
-        print(f"Model used: {model_used}")
+        task_type = str(plan.get("task_type") or self._resolve_task_type(message, plan, context) or "execution")
+        web_mode = "news" if task_type in {"research", "ai_expert"} else "market" if task_type == "finance" else "research"
+        print(f"Task type: {task_type}")
         print(f"Tools enabled: {use_web}")
 
-        # Step 1: Gemini
+        # Step 1: primary provider
         if context.get("cancelled"):
             return "נעצר."
 
         benjamin_prompt = build_benjamin_user_prompt(message)
-        if use_web:
-            result = await generate_web(benjamin_prompt, memory_context=memory_context)
-        else:
-            result = await generate_fast(benjamin_prompt, memory_context=memory_context)
+        result, provider = await model_router.generate(
+            prompt=benjamin_prompt,
+            task_type=task_type,
+            memory_context=memory_context,
+            use_web=use_web,
+            require_code_review=bool(plan.get("require_code_review")),
+            require_verification=bool(plan.get("require_verification")),
+            web_mode=web_mode,
+        )
 
         claude_called = False
         claude_applied = False
@@ -691,7 +696,7 @@ class BenjaminOrchestrator:
 
         if plan.get("require_verification"):
             claude_called = True
-            claude_out = await sanity_check_answer(result)
+            claude_out = await sanity_check_answer(result, message)
             if claude_out and claude_out.strip() != result.strip():
                 claude_applied = True
                 if refinement_count < MAX_REFINEMENT_PASSES:
@@ -706,10 +711,15 @@ class BenjaminOrchestrator:
                         f"---\n"
                         f"Return the corrected final answer only."
                     )
-                    if use_web:
-                        result = await generate_web(revised_prompt, memory_context=memory_context)
-                    else:
-                        result = await generate_fast(revised_prompt, memory_context=memory_context)
+                    result, provider = await model_router.generate(
+                        prompt=revised_prompt,
+                        task_type=task_type,
+                        memory_context=memory_context,
+                        use_web=use_web,
+                        require_verification=False,
+                        require_code_review=False,
+                        web_mode=web_mode,
+                    )
                 else:
                     result = claude_out
 
@@ -719,7 +729,7 @@ class BenjaminOrchestrator:
 
         if plan.get("require_code_review"):
             claude_called = True
-            claude_out = await review_and_improve_code(result)
+            claude_out = await review_and_improve_code(result, message)
             if claude_out and claude_out.strip() != result.strip():
                 claude_applied = True
                 if refinement_count < MAX_REFINEMENT_PASSES:
@@ -733,11 +743,18 @@ class BenjaminOrchestrator:
                         f"---\n"
                         f"Return the corrected final code/answer only."
                     )
-                    # Code usually doesn't need web
-                    result = await generate_fast(revised_prompt, memory_context=memory_context)
+                    result, provider = await model_router.generate(
+                        prompt=revised_prompt,
+                        task_type="code",
+                        memory_context=memory_context,
+                        use_web=False,
+                        require_code_review=False,
+                        require_verification=False,
+                    )
                 else:
                     result = claude_out
 
+        print(f"Primary provider: {provider}")
         print(f"Effective level: {plan.get('suggested_automation_level')}")
         print(f"Claude called: {claude_called}")
         print(f"Claude applied: {claude_applied}")

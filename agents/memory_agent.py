@@ -64,7 +64,7 @@ class MemoryAgent(BaseAgent):
             value = str(memory_to_write.get("value") or "").strip()
             mtype = str(memory_to_write.get("type") or "fact").strip() or "fact"
             if value:
-                upsert_memory(user_id, key, value, mtype)
+                upsert_memory(user_id, mtype, key, value)
                 result = build_agent_result(
                     agent=self.name,
                     output=value,

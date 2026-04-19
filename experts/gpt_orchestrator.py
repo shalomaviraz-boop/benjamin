@@ -223,6 +223,7 @@ Return ONLY valid JSON with this schema:
 
 Rules:
 - Extract ONLY stable traits, goals, preferences, identity facts.
+- Prefer these fields when relevant: communication_style, preferences, dislikes, active_projects, recurring_goals, decision_patterns, name, location, role.
 - Ignore temporary states ("אני עייף היום", "בא לי פיצה").
 - If nothing durable → return field="" and confidence=0.
 - Confidence must reflect how sure you are this is long-term.
@@ -254,6 +255,9 @@ def _build_user_prompt(message: str, memory_context: Optional[dict]) -> str:
             lines.append(f"- ({t}) {k}: {v}")
     if project_state:
         lines.append("PROJECT_STATE: " + _clip(project_state, 400))
+    user_brief = mc.get("user_brief")
+    if user_brief:
+        lines.append("USER_BRIEF: " + _clip(user_brief, 500))
 
     lines.append("USER_MESSAGE: " + message)
     return "\n".join(lines)

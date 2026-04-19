@@ -69,7 +69,7 @@ class PlanningAgent(BaseAgent):
             "Rules:\n"
             "- Keep 2-5 steps.\n"
             "- Be concise and concrete.\n"
-            "- Use only these agent names in recommended_agent_sequence: research, planning, execution, verification, memory.\n"
+            "- Use only these agent names in recommended_agent_sequence: research, memory, planning, execution, verification, code, finance, assistant, fitness_health, relationships, business_strategy, ai_expert.\n"
             f"- User task: {message}\n"
         )
         raw = await generate_fast(prompt)
@@ -85,7 +85,20 @@ class PlanningAgent(BaseAgent):
         sequence = out.get("recommended_agent_sequence")
         if not isinstance(sequence, list):
             sequence = []
-        allowed = {"research", "planning", "execution", "verification", "memory"}
+        allowed = {
+            "research",
+            "memory",
+            "planning",
+            "execution",
+            "verification",
+            "code",
+            "finance",
+            "assistant",
+            "fitness_health",
+            "relationships",
+            "business_strategy",
+            "ai_expert",
+        }
         sequence = [str(s).strip() for s in sequence if str(s).strip() in allowed]
         if not sequence:
             sequence = ["execution"]

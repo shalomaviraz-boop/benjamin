@@ -5,7 +5,7 @@ from telegram.ext import ContextTypes
 from agents.agent_context import read_shared_context
 from agents.agent_contract import build_agent_result
 from agents.base_agent import BaseAgent
-from experts.gemini_client import generate_web
+from experts.model_router import model_router
 
 
 NEWS_KEYWORDS = [
@@ -19,9 +19,11 @@ def _is_news_query(message: str) -> bool:
     return any(keyword in msg for keyword in NEWS_KEYWORDS)
 
 
-def _build_research_prompt(message: str) -> str:
+def _build_research_prompt(message: str, agent_name: str = "research", description: str = "") -> str:
+    role_line = f"אתה הסוכן {agent_name} של בנימין. {description}".strip()
     if _is_news_query(message):
         return (
+            f"{role_line}\n"
             "ענה בעברית, קצר, חד ומדויק. מדובר בבקשת חדשות/עדכונים ולכן חובה להחזיר מידע עדכני בלבד מהווב.\n"
             "חוקים מחייבים:\n"
             "- תביא רק 3 עד 5 עדכונים הכי חשובים ורלוונטיים\n"
@@ -35,6 +37,7 @@ def _build_research_prompt(message: str) -> str:
         )
 
     return (
+        f"{role_line}\n"
         "ענה בעברית בצורה קצרה, חדה ומבוססת מקורות עדכניים.\n"
         "חוקים:\n"
         "- אם השאלה נוגעת למידע עדכני, חובה להסתמך על ווב עדכני\n"
@@ -76,7 +79,13 @@ class ResearchAgent(BaseAgent):
             "- מקסימום 220 מילים לכל הדוח\n"
             "- אם אין מספיק אירועים מהותיים, כתוב רק את המשמעותיים באמת\n"
         )
-        return await generate_web(prompt)
+        report, _ = await model_router.generate(
+            prompt=prompt,
+            task_type=self.name,
+            use_web=True,
+            web_mode="news",
+        )
+        return report
 
     async def run(self, task: dict, context: dict) -> dict:
         shared = read_shared_context(task, context)
@@ -94,13 +103,21 @@ class ResearchAgent(BaseAgent):
             result["agent_context"] = shared.to_dict()
             return result
 
-        prompt = _build_research_prompt(message)
+        prompt = _build_research_prompt(message, self.name, self.description)
         try:
-            output = await generate_web(prompt, memory_context=shared.memory_context or (context or {}).get("memory_context"))
+            web_mode = "news" if _is_news_query(message) or self.name == "ai_expert" else "market" if self.name == "finance" else "research"
+            output, provider = await model_router.generate(
+                prompt=prompt,
+                task_type=self.name,
+                memory_context=shared.memory_context or (context or {}).get("memory_context"),
+                use_web=True,
+                require_verification=bool((shared.task or {}).get("require_verification")),
+                web_mode=web_mode,
+            )
             result = build_agent_result(
                 agent=self.name,
                 output=output,
-                notes="news research completed" if _is_news_query(message) else "web research completed",
+                notes=f"provider={provider}, mode={web_mode}",
                 agent_context=shared.to_dict(),
             )
             shared.research_output = result

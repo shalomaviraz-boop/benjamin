@@ -1,6 +1,7 @@
-"""Claude Worker - Code review/improve + Sanity check via Anthropic SDK."""
+"""Claude Worker - deep reasoning, code review, and verification via Anthropic SDK."""
 import os
 import time
+import asyncio
 
 import anthropic
 
@@ -25,8 +26,8 @@ def get_client():
     return _client
 
 
-def review_and_improve_code(code_text: str, user_request: str) -> str:
-    """P4: Gemini generates code draft → Claude reviews and improves it."""
+def _review_and_improve_code_sync(code_text: str, user_request: str) -> str:
+    """P4: another model generates code draft → Claude reviews and improves it."""
     client = get_client()
     start = time.time()
 
@@ -54,7 +55,7 @@ def review_and_improve_code(code_text: str, user_request: str) -> str:
     return result.strip()
 
 
-def sanity_check_answer(
+def _sanity_check_answer_sync(
     draft_answer: str,
     user_request: str,
     sources_text: str | None = None,
@@ -92,3 +93,47 @@ def sanity_check_answer(
 
     result = response.content[0].text if response.content else ""
     return result.strip()
+
+
+def _generate_reasoning_sync(prompt: str, *, system_prompt: str | None = None) -> str:
+    client = get_client()
+    start = time.time()
+
+    messages = [{"role": "user", "content": prompt}]
+    kwargs = {}
+    if system_prompt:
+        kwargs["system"] = system_prompt
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        messages=messages,
+        **kwargs,
+    )
+
+    latency_ms = int((time.time() - start) * 1000)
+    print(f"Claude model used: {CLAUDE_MODEL} | latency: {latency_ms}ms")
+
+    result = response.content[0].text if response.content else ""
+    return result.strip()
+
+
+async def review_and_improve_code(code_text: str, user_request: str) -> str:
+    return await asyncio.to_thread(_review_and_improve_code_sync, code_text, user_request)
+
+
+async def sanity_check_answer(
+    draft_answer: str,
+    user_request: str,
+    sources_text: str | None = None,
+) -> str:
+    return await asyncio.to_thread(
+        _sanity_check_answer_sync,
+        draft_answer,
+        user_request,
+        sources_text,
+    )
+
+
+async def generate_reasoning(prompt: str, *, system_prompt: str | None = None) -> str:
+    return await asyncio.to_thread(_generate_reasoning_sync, prompt, system_prompt=system_prompt)

@@ -56,6 +56,7 @@ def _inject_memory(contents: str, memory_context) -> str:
         return f"{mem_block}\n\n{contents}"
 
     user_profile = memory_context.get("user_profile") or {}
+    user_brief = memory_context.get("user_brief") or {}
     personal_model = memory_context.get("personal_model") or {}
     relevant_memories = memory_context.get("relevant_memories") or []
     recent_memories = memory_context.get("recent_memories") or []
@@ -70,6 +71,13 @@ def _inject_memory(contents: str, memory_context) -> str:
         lines.append("## User Profile")
         for k, v in user_profile.items():
             if v is None:
+                continue
+            lines.append(f"- {k}: {v}")
+
+    if isinstance(user_brief, dict) and user_brief:
+        lines.append("## User Brief")
+        for k, v in user_brief.items():
+            if v is None or v == "" or v == [] or v == {}:
                 continue
             lines.append(f"- {k}: {v}")
 
