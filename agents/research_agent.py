@@ -6,11 +6,14 @@ from agents.agent_context import read_shared_context
 from agents.agent_contract import build_agent_result
 from agents.base_agent import BaseAgent
 from experts.gemini_client import generate_web
+from experts.model_router import WEB_UNAVAILABLE_MESSAGE, _looks_like_stale_cutoff
 
 
 NEWS_KEYWORDS = [
     "חדשות", "עדכונים", "אחרונות", "אחרונים", "מה חדש", "מה קורה", "היום",
+    "עדכון אחרון", "הכרזות אחרונות", "פריצות דרך",
     "latest", "news", "current", "recent", "today", "update", "updates",
+    "breaking", "release", "releases", "launch",
 ]
 
 
@@ -22,24 +25,26 @@ def _is_news_query(message: str) -> bool:
 def _build_research_prompt(message: str) -> str:
     if _is_news_query(message):
         return (
-            "ענה בעברית, קצר, חד ומדויק. מדובר בבקשת חדשות/עדכונים ולכן חובה להחזיר מידע עדכני בלבד מהווב.\n"
+            "אתה בנימין, עוזר אישי פרימיום. תענה בעברית, קצר, חד, ברור, בקול אישי וטבעי — "
+            "לא בסגנון דוח רובוטי ולא בסגנון 'אינטליגנס'.\n"
+            "זו בקשת חדשות/עדכונים → חובה להשתמש בחיפוש גוגל בזמן אמת ולהחזיר אך ורק מידע עדכני.\n"
             "חוקים מחייבים:\n"
-            "- תביא רק 3 עד 5 עדכונים הכי חשובים ורלוונטיים\n"
-            "- לכל עדכון חובה לציין תאריך מפורש\n"
-            "- אל תביא מידע ישן או רקע היסטורי אם לא התבקש\n"
-            "- אם אין ודאות או שהמידע לא עדכני מספיק, תגיד זאת במפורש\n"
-            "- בלי הקדמה כללית ובלי חפירות\n"
-            "- התחל ישר מהעדכונים\n"
-            "- בסוף תן שורת סיכום אחת: למה זה חשוב\n\n"
+            "- 3 עד 5 עדכונים הכי חשובים ועדכניים\n"
+            "- לכל עדכון חובה תאריך מפורש (יום/חודש/שנה)\n"
+            "- בלי רקע היסטורי ובלי מידע ישן\n"
+            "- בלי 'נכון לעדכון האחרון שלי' ובלי אזכור של תאריך cutoff\n"
+            "- בלי להקדים עם 'להלן', 'לסיכום', 'נכון ל'\n"
+            "- אם לא קיבלת מידע ודאי עדכני ממקורות חיים — תגיד זאת בפירוש, אל תמציא\n"
+            "- שורת סיכום אחת בסוף: למה זה חשוב עכשיו\n\n"
             f"בקשת המשתמש: {message}"
         )
 
     return (
-        "ענה בעברית בצורה קצרה, חדה ומבוססת מקורות עדכניים.\n"
+        "אתה בנימין. ענה בעברית, קצר, חד, מבוסס מקורות עדכניים.\n"
         "חוקים:\n"
         "- אם השאלה נוגעת למידע עדכני, חובה להסתמך על ווב עדכני\n"
-        "- אם חסר מידע ודאי תגיד זאת\n"
-        "- בלי הקדמות מיותרות\n\n"
+        "- אם חסר מידע ודאי תגיד זאת במפורש\n"
+        "- בלי הקדמות מיותרות ובלי חפירות\n\n"
         f"בקשת המשתמש: {message}"
     )
 
@@ -81,6 +86,9 @@ class ResearchAgent(BaseAgent):
     async def run(self, task: dict, context: dict) -> dict:
         shared = read_shared_context(task, context)
         message = (shared.user_message or task.get("message") or "").strip()
+        plan = shared.task or task.get("plan") or {}
+        grounded_web = bool(plan.get("grounded_web")) or _is_news_query(message)
+
         if not message:
             result = build_agent_result(
                 agent=self.name,
@@ -96,18 +104,28 @@ class ResearchAgent(BaseAgent):
 
         prompt = _build_research_prompt(message)
         try:
-            output = await generate_web(prompt, memory_context=shared.memory_context or (context or {}).get("memory_context"))
-            result = build_agent_result(
-                agent=self.name,
-                output=output,
-                notes="news research completed" if _is_news_query(message) else "web research completed",
-                agent_context=shared.to_dict(),
+            output = await generate_web(
+                prompt,
+                memory_context=shared.memory_context or (context or {}).get("memory_context"),
+                web_mode="news" if _is_news_query(message) else "research",
             )
-            shared.research_output = result
-            shared.add_log(self.name, "research success")
-            result["agent_context"] = shared.to_dict()
-            return result
         except Exception as e:
+            shared.add_log(self.name, f"research web call failed: {e}")
+            # On a realtime/grounded query we refuse to fall back to a
+            # non-web provider — a stale answer is worse than a clear
+            # "live retrieval unavailable" message.
+            if grounded_web:
+                result = build_agent_result(
+                    agent=self.name,
+                    output=WEB_UNAVAILABLE_MESSAGE,
+                    notes=f"web unavailable on grounded_web query: {e}",
+                    should_fallback=False,
+                    agent_context=shared.to_dict(),
+                )
+                shared.research_output = result
+                shared.final_output = WEB_UNAVAILABLE_MESSAGE
+                result["agent_context"] = shared.to_dict()
+                return result
             result = build_agent_result(
                 agent=self.name,
                 status="failed",
@@ -116,9 +134,36 @@ class ResearchAgent(BaseAgent):
                 agent_context=shared.to_dict(),
             )
             shared.research_output = result
-            shared.add_log(self.name, f"research failed: {e}")
             result["agent_context"] = shared.to_dict()
             return result
+
+        text = (output or "").strip()
+        # If we asked for realtime and the model served a stale-cutoff answer,
+        # refuse it and return the clear unavailability message.
+        if grounded_web and (not text or _looks_like_stale_cutoff(text)):
+            shared.add_log(self.name, "grounded_web: model returned stale/empty; refusing")
+            result = build_agent_result(
+                agent=self.name,
+                output=WEB_UNAVAILABLE_MESSAGE,
+                notes="web grounding returned stale or empty content",
+                should_fallback=False,
+                agent_context=shared.to_dict(),
+            )
+            shared.research_output = result
+            shared.final_output = WEB_UNAVAILABLE_MESSAGE
+            result["agent_context"] = shared.to_dict()
+            return result
+
+        result = build_agent_result(
+            agent=self.name,
+            output=text,
+            notes="news research completed" if _is_news_query(message) else "web research completed",
+            agent_context=shared.to_dict(),
+        )
+        shared.research_output = result
+        shared.add_log(self.name, "research success")
+        result["agent_context"] = shared.to_dict()
+        return result
 
     async def run_proactive_report(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:

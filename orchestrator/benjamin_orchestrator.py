@@ -35,6 +35,7 @@ TASK_AGENT_MAP = {
     "relationships": "relationships",
     "business_strategy": "business_strategy",
     "ai_expert": "ai_expert",
+    # personal_synthesis is handled directly in the model router, no specialized agent.
 }
 
 
@@ -55,6 +56,7 @@ def _normalize_plan(plan: dict | None) -> dict:
     plan.setdefault("execution_mode", "direct")
     plan.setdefault("tools_required", [])
     plan.setdefault("use_web", False)
+    plan.setdefault("grounded_web", False)
     plan.setdefault("require_verification", False)
     plan.setdefault("require_code_review", False)
     plan.setdefault("require_task_decomposition", False)
@@ -68,6 +70,13 @@ def _normalize_plan(plan: dict | None) -> dict:
     if plan["execution_mode"] not in {"direct", "agent_loop"}:
         plan["execution_mode"] = "agent_loop" if plan["suggested_automation_level"] >= 3 else "direct"
     plan["use_web"] = _bool(plan["use_web"])
+    plan["grounded_web"] = _bool(plan["grounded_web"])
+    # When we've already marked the answer as grounded on the live web,
+    # don't let a non-web model overwrite it with stale cutoff knowledge.
+    if plan["grounded_web"]:
+        plan["use_web"] = True
+        plan["require_verification"] = False
+        plan["require_code_review"] = False
     plan["require_verification"] = _bool(plan["require_verification"])
     plan["require_code_review"] = _bool(plan["require_code_review"])
     plan["require_task_decomposition"] = _bool(plan["require_task_decomposition"])
@@ -155,6 +164,8 @@ class BenjaminOrchestrator:
 
     def _resolve_task_type(self, message: str, plan: dict, context: dict | None = None) -> str | None:
         explicit = str(plan.get("task_type") or "").strip()
+        if explicit == "personal_synthesis":
+            return "personal_synthesis"
         if explicit in TASK_AGENT_MAP:
             return explicit
         msg = (message or "").lower()
@@ -203,7 +214,10 @@ class BenjaminOrchestrator:
             return None
         output = routed.get("output")
         if isinstance(output, str) and output.strip():
-            if plan.get("require_verification") or plan.get("require_code_review"):
+            # Never run Claude sanity_check on a web-grounded realtime answer —
+            # Claude has no web access and will overwrite current news with
+            # stale cutoff knowledge ("up to April 2024...").
+            if (plan.get("require_verification") or plan.get("require_code_review")) and not plan.get("grounded_web"):
                 verifier = self.agent_registry.get("verification")
                 verify_fn = getattr(verifier, "run", None) if verifier else None
                 if callable(verify_fn):
@@ -218,11 +232,13 @@ class BenjaminOrchestrator:
         if context.get("cancelled"):
             return "נעצר."
         result, provider_used = await self.model_router.generate(message=message, plan=plan, memory_context=memory_context)
-        if plan.get("require_verification"):
+        # Same guard as the specialized path: never run a non-web verifier over
+        # a web-grounded realtime answer.
+        if plan.get("require_verification") and not plan.get("grounded_web"):
             checked = await sanity_check_answer(result, message, None)
             if checked and checked.strip():
                 result = checked.strip()
-        if plan.get("require_code_review"):
+        if plan.get("require_code_review") and not plan.get("grounded_web"):
             checked = await review_and_improve_code(result, message)
             if checked and checked.strip():
                 result = checked.strip()
