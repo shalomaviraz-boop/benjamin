@@ -16,7 +16,6 @@ from telegram.ext import (
 )
 
 from handlers.message_handler import BenjaminMessageHandler
-from memory.memory_store import seed_user_core_profile
 
 # --- Proactive jobs ---
 from datetime import time as dtime
@@ -41,20 +40,11 @@ async def send_ai_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def send_proactive_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Scheduled intelligence feed - 2 times a day."""
-    chat_id = context.job.data.get("chat_id") if context.job and context.job.data else None
-    if chat_id:
-        seed_user_core_profile(str(chat_id))
-    await registry.get("research").run_proactive_report(
-        context,
-        registry.get("quality"),
-    )
+    await registry.get("research").run_proactive_report(context)
 
 
 async def check_breaking_events(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Checks for important global breaking events and pushes immediately."""
-    chat_id = context.job.data.get("chat_id") if context.job and context.job.data else None
-    if chat_id:
-        seed_user_core_profile(str(chat_id))
     await registry.get("breaking").run_check(
         context,
         registry.get("quality"),

@@ -17,6 +17,3 @@ class HybridRouter:
 
     async def analyze_governor(self, message: str, personal_model: dict | None = None) -> dict:
         return await self.gpt.analyze_governor(message, personal_model=personal_model or {})
-
-    async def extract_profile_update(self, message: str) -> dict:
-        return await self.gpt.extract_profile_update(message)

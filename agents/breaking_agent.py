@@ -10,14 +10,9 @@ from pathlib import Path
 from telegram.ext import ContextTypes
 
 from experts.gemini_client import generate_web
-from memory.memory_store import load_memory_context_snapshot
 
 from agents.memory_agent import MemoryAgent
 from agents.priority_agent import PriorityAgent
-from agents.proactive_filters import (
-    commit_send,
-    gate_proactive_candidate,
-)
 from agents.quality_agent import QualityAgent
 
 _STATE_DB_PATH = Path(__file__).resolve().parent.parent / "proactive_state.db"
@@ -314,15 +309,6 @@ class BreakingAgent:
             text += f"\n\n🎯 למה זה חשוב:\n{why_it_matters}"
         return text
 
-    def build_personal_candidate(self, verified: dict, scored: dict) -> dict:
-        return {
-            "category": _normalize_category(verified.get("category")),
-            "headline": (verified.get("headline") or "").strip(),
-            "summary": (verified.get("summary") or "").strip(),
-            "why_relevant": (verified.get("why_it_matters") or "").strip() or (scored.get("reason") or "").strip(),
-            "opportunity": (scored.get("opportunity") or "").strip(),
-        }
-
     async def run_check(
         self,
         context: ContextTypes.DEFAULT_TYPE,
@@ -335,10 +321,6 @@ class BreakingAgent:
             chat_id = context.job.data.get("chat_id")
             if not chat_id:
                 return
-            memory_context = load_memory_context_snapshot(
-                str(chat_id),
-                "breaking alert ai markets business super agent",
-            )
 
             raw_candidate = await self.detect()
             candidate = _extract_json_object(raw_candidate)
@@ -352,7 +334,7 @@ class BreakingAgent:
             if not self.should_send(verified):
                 return
 
-            scored = await priority.score_event(verified, memory_context=memory_context)
+            scored = await priority.score_event(verified)
             print(f"Priority score: {scored.get('priority_score')}")
             if not scored.get("should_send"):
                 return
@@ -371,38 +353,15 @@ class BreakingAgent:
             ):
                 return
 
-            candidate = self.build_personal_candidate(verified, scored)
-            candidate.setdefault("severity", (verified.get("severity") or "").strip().lower())
-            candidate.setdefault("event_cluster", (verified.get("event_cluster") or "").strip())
-            candidate.setdefault("should_send", True)
-            candidate.setdefault("confidence", verified.get("confidence"))
-
-            gate = gate_proactive_candidate(
-                user_id=str(chat_id),
-                candidate=candidate,
-                memory_context=memory_context,
-                min_relevance=40,
-            )
-            if not gate.get("allowed"):
-                print(f"Breaking gate blocked: {gate.get('reason')}")
-                memory.update_event(topic_key, category, sent=False, verified=verified)
-                return
-
-            text = await quality.render_proactive_message(
-                candidate=candidate,
-                memory_context=memory_context,
-            )
-            if not text.strip():
-                text = self.format_text(verified)
+            text = self.format_text(verified)
+            text = await quality.polish(text)
 
             await context.bot.send_message(chat_id=chat_id, text=text)
             _mark_cluster(cluster_key, category)
             _mark_alert_sent(dedupe_key, category)
-            commit_send(str(chat_id), candidate=candidate, gate_result=gate)
             memory.update_event(topic_key, category, sent=True, verified=verified)
             print(
-                f"Breaking alert sent: {category} | {verified.get('headline')} | "
-                f"cluster={cluster_key} | relevance={gate.get('relevance')}"
+                f"Breaking alert sent: {category} | {verified.get('headline')} | cluster={cluster_key}"
             )
 
         except Exception as e:

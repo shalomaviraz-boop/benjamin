@@ -2,9 +2,8 @@
 import os
 import asyncio
 
-from google import genai
-from google.genai import types
-from memory.memory_store import format_memory_for_prompt
+genai = None
+types = None
 
 FAST_MODEL = "gemini-3-flash-preview"
 SEARCH_MODEL = "gemini-3-flash-preview"
@@ -15,26 +14,28 @@ _client = None
 WEB_MODE_PREFIXES = {
     "news": (
         "CRITICAL: This is a latest-news query. Use Google Search and return only current, recent, date-specific information. "
-        "Do not rely on stale knowledge. Include explicit dates for each major item. Ignore old background unless directly needed. "
-        "Keep the tone sharp, direct, and human. Do not append raw URLs or source dumps unless explicitly asked."
+        "Do not rely on stale knowledge. Include explicit dates for each major item. Ignore old background unless directly needed."
     ),
     "market": (
         "CRITICAL: This is a market/current-status query. Use Google Search and return only current, date-specific information. "
-        "Do not rely on stale knowledge. If data timing is unclear, say so explicitly. "
-        "Keep the tone sharp and practical. No raw source links unless explicitly asked."
+        "Do not rely on stale knowledge. If data timing is unclear, say so explicitly."
     ),
     "research": (
         "Use Google Search when needed and prioritize up-to-date, source-backed information. "
-        "If certainty is limited, say so explicitly. "
-        "Answer like an elite operator: concise, direct, practical. No raw source links unless explicitly asked."
+        "If certainty is limited, say so explicitly."
     ),
 }
 
 
 def get_client():
     """Create client once, reuse."""
-    global _client
+    global _client, genai, types
     if _client is None:
+        if genai is None or types is None:
+            from google import genai as _genai
+            from google.genai import types as _types
+            genai = _genai
+            types = _types
         key = os.getenv("GEMINI_API_KEY")
         if not key:
             raise ValueError("GEMINI_API_KEY not set in .env")
@@ -59,27 +60,102 @@ def _inject_memory(contents: str, memory_context) -> str:
         mem_block = f"# Memory Context\n{str(memory_context)}"
         return f"{mem_block}\n\n{contents}"
 
-    mem_block = format_memory_for_prompt(
-        memory_context,
-        detailed=True,
-        include_conversation=True,
-    )
+    user_profile = memory_context.get("user_profile") or {}
+    personal_model = memory_context.get("personal_model") or {}
+    relevant_memories = memory_context.get("relevant_memories") or []
+    recent_memories = memory_context.get("recent_memories") or []
+    project_state = memory_context.get("project_state") or {}
+    conversation_tail = memory_context.get("conversation_tail") or []
+
+    lines: list[str] = []
+    lines.append("# Memory Context")
+
+    # Profile
+    if isinstance(user_profile, dict) and user_profile:
+        lines.append("## User Profile")
+        for k, v in user_profile.items():
+            if v is None:
+                continue
+            lines.append(f"- {k}: {v}")
+
+    if isinstance(personal_model, dict) and personal_model:
+        lines.append("## Personal Model")
+        for k, v in personal_model.items():
+            if v is None:
+                continue
+            lines.append(f"- {k}: {v}")
+
+    # Governor guidance (internal)
     governor = memory_context.get("governor") or {}
     if isinstance(governor, dict) and governor:
-        gov_lines = ["## Governor Guidance"]
-        for key in (
-            "alignment_score",
-            "risk_pattern",
-            "intervention_level",
-            "recommended_action",
-            "opening_line",
-            "sharp_question",
-        ):
-            value = governor.get(key)
-            if value in (None, "", [], {}):
+        lines.append("## Governor Guidance")
+        il = governor.get("intervention_level")
+        act = governor.get("recommended_action")
+        ol = (governor.get("opening_line") or "").strip()
+        sq = (governor.get("sharp_question") or "").strip()
+        rp = governor.get("risk_pattern")
+        sc = governor.get("alignment_score")
+        lines.append(f"- alignment_score: {sc}")
+        lines.append(f"- risk_pattern: {rp}")
+        lines.append(f"- intervention_level: {il}")
+        lines.append(f"- recommended_action: {act}")
+        if ol:
+            lines.append(f"- opening_line: {ol}")
+        if sq:
+            lines.append(f"- sharp_question: {sq}")
+
+    # Conversation tail
+    if isinstance(conversation_tail, list) and conversation_tail:
+        lines.append("## Conversation (recent turns)")
+        for m in conversation_tail[-15:]:
+            if not isinstance(m, dict):
                 continue
-            gov_lines.append(f"- {key}: {value}")
-        mem_block = (mem_block + "\n" + "\n".join(gov_lines)).strip()
+            role = (m.get("role") or "").strip() or "unknown"
+            text = (m.get("content") or "").strip()
+            if not text:
+                continue
+            # Keep it compact
+            if len(text) > 800:
+                text = text[:800].rstrip() + "…"
+            lines.append(f"- {role}: {text}")
+
+    # Relevant memories (semantic)
+    if isinstance(relevant_memories, list) and relevant_memories:
+        lines.append("## Relevant Memories")
+        for mem in relevant_memories[:10]:
+            if isinstance(mem, dict):
+                key = (mem.get("key") or "").strip()
+                val = mem.get("value")
+                if key:
+                    lines.append(f"- {key}: {val}")
+                else:
+                    lines.append(f"- {val}")
+            else:
+                lines.append(f"- {mem}")
+
+    # Recent memories (last written)
+    if isinstance(recent_memories, list) and recent_memories:
+        lines.append("## Recent Memories")
+        for mem in recent_memories[:10]:
+            if isinstance(mem, dict):
+                key = (mem.get("key") or "").strip()
+                val = mem.get("value")
+                if key:
+                    lines.append(f"- {key}: {val}")
+                else:
+                    lines.append(f"- {val}")
+            else:
+                lines.append(f"- {mem}")
+
+    # Project state
+    if isinstance(project_state, dict) and project_state:
+        lines.append("## Project State")
+        for k, v in project_state.items():
+            if v is None:
+                continue
+            lines.append(f"- {k}: {v}")
+
+    mem_block = "\n".join(lines)
     return f"{mem_block}\n\n{contents}"
 
 
@@ -133,8 +209,7 @@ def _generate_web_sync(contents: str, web_mode: str = "research") -> str:
     )
 
     text = response.text or ""
-    _extract_grounding_sources(response)
-    return text
+    return text.strip()
 
 
 async def generate_fast(

@@ -146,58 +146,6 @@ class MemoryAgent(BaseAgent):
                 return False
         return True
 
-    def update_event(
-        self,
-        topic_key: str,
-        category: str,
-        *,
-        sent: bool,
-        verified: dict | None = None,
-    ) -> None:
-        verified = verified or {}
-        headline = (verified.get("headline") or "").strip()
-        summary = (verified.get("summary") or "").strip()
-        severity = (verified.get("severity") or "").strip().lower()
-        self.mark_event(
-            topic_key,
-            category=(category or "").strip().lower(),
-            headline=headline,
-            summary=summary,
-            severity=severity,
-            sent=sent,
-        )
-
-    def is_major_change(self, topic_key: str, verified: dict) -> bool:
-        """Heuristic: only treat as major change if severity is critical or summary diverges materially."""
-        if not topic_key or not isinstance(verified, dict):
-            return False
-        new_severity = (verified.get("severity") or "").strip().lower()
-        new_summary = (verified.get("summary") or "").strip().lower()
-        if new_severity == "critical":
-            return True
-        conn = self._conn()
-        try:
-            row = conn.execute(
-                "SELECT last_summary, last_severity FROM event_memory WHERE topic_key = ?",
-                (topic_key,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row:
-            return True
-        prev_summary = (row[0] or "").lower()
-        prev_severity = (row[1] or "").lower()
-        if not prev_summary:
-            return True
-        if new_severity and new_severity != prev_severity and new_severity in {"high", "critical"}:
-            return True
-        prev_tokens = set(re.findall(r"[\w\u0590-\u05FF]{4,}", prev_summary))
-        new_tokens = set(re.findall(r"[\w\u0590-\u05FF]{4,}", new_summary))
-        if not new_tokens:
-            return False
-        overlap = len(prev_tokens & new_tokens) / max(len(new_tokens), 1)
-        return overlap < 0.4
-
     def mark_event(self, topic_key: str, category: str, headline: str, summary: str, severity: str, *, sent: bool) -> None:
         if not topic_key:
             return
